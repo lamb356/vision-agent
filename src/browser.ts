@@ -72,7 +72,7 @@ export async function waitForStability(page: Page, ms: number = 500): Promise<vo
 const DOM_EXTRACT_SCRIPT = `
 (function() {
   var codes = {};
-  var codePattern = /\\b[A-Za-z0-9]{6}\\b/g;
+  var codePattern = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/g;
   var m;
 
   // 1. All visible text content

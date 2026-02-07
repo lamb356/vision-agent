@@ -219,7 +219,7 @@ function clampText(text: string, maxLength: number): string {
 function pickCode(codes: Array<{ code: string; score: number }>, exclude?: Set<string>): string | null {
   const normalized = codes
     .map((c) => c.code.trim())
-    .filter((code) => /^[A-Za-z0-9]{6}$/.test(code))
+    .filter((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code))
     .filter((code) => !exclude || !exclude.has(code));
   if (normalized.length > 0) return normalized[0];
   return null;
@@ -429,7 +429,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
     });
 
   var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 800);
-  var hasCodeVisible = /[A-Za-z0-9]{6}/.test(bodyText);
+  var hasCodeVisible = /(?=.*[0-9])[A-Za-z0-9]{6}/.test(bodyText);
   var hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
   var hasClickHereText = /(click here|click\\s+\\d+\\s+times)/i.test(bodyText);
 
@@ -540,6 +540,28 @@ async function executeAction(page: Page, action: AgentAction): Promise<ExecResul
 }
 
 async function dismissOverlays(page: Page, deadline: number): Promise<void> {
+  // Nuclear overlay removal: forcefully remove blocking overlays from DOM
+  await page.evaluate(`(function() {
+    var all = document.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var style = window.getComputedStyle(el);
+      var pos = style.position;
+      if (pos !== "fixed" && pos !== "absolute") continue;
+      var z = parseInt(style.zIndex, 10);
+      if (isNaN(z) || z <= 999) continue;
+      if (el.querySelector("input, textarea, select")) continue;
+      var text = (el.innerText || "").toLowerCase();
+      if (/step\\s+\\d/.test(text)) continue;
+      var dominated = parseFloat(style.opacity) < 1
+        || /prize|won|congratulations|winner|reward/i.test(text);
+      var isBackdrop = el.children.length === 0 && text.trim().length === 0;
+      if (dominated || isBackdrop) {
+        el.remove();
+      }
+    }
+  })()`).catch(() => undefined);
+
   const dismissSelectors = [
     '[aria-label*="close" i]',
     '[aria-label*="dismiss" i]',
