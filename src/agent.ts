@@ -23,7 +23,7 @@ import {
 } from "./browser.js";
 
 const STEP_DEADLINE_MS = 9000;
-const MAX_STEP_ATTEMPTS = 5;
+const MAX_STEP_ATTEMPTS = 2;
 const DISMISS_TIME_CAP_MS = 2500;
 const MAX_DISMISS_ROUNDS = 3;
 const MAX_SCOUT_BATCHES = 1;
@@ -276,13 +276,16 @@ async function injectEIDs(page: Page): Promise<number> {
     document.querySelectorAll("*").forEach(function(el) {
       if (el.scrollHeight > el.clientHeight + 20) { elements.add(el); }
     });
-    var count = 0;
+    if (!window.__agentEidCounter) window.__agentEidCounter = 0;
+    var assigned = 0;
     elements.forEach(function(el) {
-      count += 1;
-      var eid = "E" + String(count).padStart(3, "0");
+      if (el.getAttribute("data-agent-eid")) return;
+      window.__agentEidCounter += 1;
+      var eid = "E" + String(window.__agentEidCounter).padStart(3, "0");
       el.setAttribute("data-agent-eid", eid);
+      assigned += 1;
     });
-    return count;
+    return assigned;
   })()`) as Promise<number>;
 }
 
@@ -575,23 +578,62 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
 
 async function selectSubmitButton(
   page: Page,
-  snap: DOMSnapshot
+  inputEid?: string | null
 ): Promise<string | null> {
-  const activeDialog = snap.activeDialogEid;
-  if (activeDialog) {
-    const dialog = snap.dialogs.find((d) => d.eid === activeDialog);
-    const candidates = dialog?.buttons ?? [];
-    const prioritized = candidates.find((b) => /submit|confirm|continue|next/i.test(b.text));
-    if (prioritized) return prioritized.eid;
-    if (candidates.length > 0) return candidates[0].eid;
-  }
+  const eidArg = inputEid ?? "";
+  return page.evaluate(`(function() {
+    var inputEl = null;
+    var inputEid = "${eidArg}";
+    if (inputEid) {
+      inputEl = document.querySelector('[data-agent-eid="' + inputEid + '"]');
+    }
 
-  const global = snap.clickables
-    .filter((c) => c.tag === "button")
-    .find((c) => /submit|confirm|continue|next/i.test(c.text || c.ariaLabel));
-  if (global) return global.eid;
+    function isVis(el) {
+      var s = window.getComputedStyle(el);
+      var r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+    }
 
-  return snap.clickables.find((c) => c.tag === "button")?.eid ?? null;
+    // (a) If input is inside a <form>, pick first visible submit in that form
+    if (inputEl) {
+      var form = inputEl.closest("form");
+      if (form) {
+        var formBtns = form.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])');
+        for (var i = 0; i < formBtns.length; i++) {
+          if (isVis(formBtns[i]) && formBtns[i].getAttribute("data-agent-eid")) {
+            return formBtns[i].getAttribute("data-agent-eid");
+          }
+        }
+      }
+    }
+
+    // Gather all visible buttons with EIDs
+    var allBtns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]'));
+    var visible = allBtns.filter(function(b) { return isVis(b) && b.getAttribute("data-agent-eid"); });
+
+    var kw = /submit|confirm|continue|next|send|ok|go/i;
+    var prioritized = visible.filter(function(b) {
+      var t = (b.innerText || b.textContent || "").trim();
+      return kw.test(t) || kw.test(b.getAttribute("aria-label") || "");
+    });
+
+    // (b) If we have an input, pick closest button by bounding-box distance
+    if (inputEl && visible.length > 0) {
+      var ir = inputEl.getBoundingClientRect();
+      var pool = prioritized.length > 0 ? prioritized : visible;
+      pool.sort(function(a, b) {
+        var ar = a.getBoundingClientRect(); var br = b.getBoundingClientRect();
+        var da = Math.hypot(ar.x + ar.width/2 - ir.x - ir.width/2, ar.y + ar.height/2 - ir.y - ir.height/2);
+        var db = Math.hypot(br.x + br.width/2 - ir.x - ir.width/2, br.y + br.height/2 - ir.y - ir.height/2);
+        return da - db;
+      });
+      return pool[0].getAttribute("data-agent-eid");
+    }
+
+    if (prioritized.length > 0) return prioritized[0].getAttribute("data-agent-eid");
+    if (visible.length > 0) return visible[0].getAttribute("data-agent-eid");
+    return null;
+  })()`) as Promise<string | null>;
 }
 
 function selectInputEid(snap: DOMSnapshot): string | null {
@@ -618,7 +660,7 @@ async function submitCodeWithSnapshot(
     await typeText(page, code);
   }
 
-  const submitEid = await selectSubmitButton(page, snap);
+  const submitEid = await selectSubmitButton(page, inputEid);
   console.log(`  [SUBMIT] submitEid=${submitEid ?? "no submit EID found"}`);
   if (submitEid) {
     const submitLoc = page.locator(`[data-agent-eid="${submitEid}"]`);
@@ -642,6 +684,13 @@ async function submitCodeWithSnapshot(
   }
 
   await waitForStability(page, 300);
+}
+
+async function submitCodeSafe(page: Page, code: string, deadline: number): Promise<void> {
+  await injectEIDs(page);
+  const snap = await captureDOMSnapshot(page);
+  await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
+  await submitCodeWithSnapshot(page, snap, code);
 }
 
 async function verifyStep(page: Page, expectedStep: number): Promise<VerifyResult> {
@@ -800,7 +849,7 @@ const DialogRadioSkill: Skill = {
     const dialogEid = snap.activeDialogEid;
     if (!dialogEid) return { code: null, actions_taken: 0, elapsed_ms: now() - start };
 
-    const scrollables = snap.scrollables.filter((s) => s.inDialog === dialogEid);
+    const scrollables = snap.scrollables.filter((s) => s.inDialog === dialogEid || s.eid === dialogEid);
     for (const scrollable of scrollables) {
       if (!withinDeadline(deadline)) break;
       await executeAction(page, { type: "scroll_eid_to_bottom", eid: scrollable.eid });
@@ -820,7 +869,7 @@ const DialogRadioSkill: Skill = {
       }
       if (exec.trapDetected) break;
 
-      const submitEid = await selectSubmitButton(page, snap);
+      const submitEid = await selectSubmitButton(page);
       if (submitEid) {
         const submitResult = await executeAction(page, { type: "click_eid", eid: submitEid });
         actions += 1;
@@ -847,7 +896,7 @@ const DialogScrollSkill: Skill = {
     const dialogEid = snap.activeDialogEid;
     if (!dialogEid) return { code: null, actions_taken: 0, elapsed_ms: now() - start };
 
-    const scrollables = snap.scrollables.filter((s) => s.inDialog === dialogEid);
+    const scrollables = snap.scrollables.filter((s) => s.inDialog === dialogEid || s.eid === dialogEid);
     for (const scrollable of scrollables) {
       for (let sweep = 0; sweep < SCROLL_SWEEPS && withinDeadline(deadline); sweep += 1) {
         await executeAction(page, { type: "scroll_eid_to_bottom", eid: scrollable.eid });
@@ -909,7 +958,7 @@ const CheckboxSkill: Skill = {
       }
     }
 
-    const submitEid = await selectSubmitButton(page, snap);
+    const submitEid = await selectSubmitButton(page);
     if (submitEid) {
       const exec = await executeAction(page, { type: "click_eid", eid: submitEid });
       actions += 1;
@@ -938,7 +987,7 @@ const DropdownSkill: Skill = {
       if (await detectTrap(page)) break;
     }
 
-    const submitEid = await selectSubmitButton(page, snap);
+    const submitEid = await selectSubmitButton(page);
     if (submitEid) {
       const exec = await executeAction(page, { type: "click_eid", eid: submitEid });
       actions += 1;
@@ -962,12 +1011,32 @@ const skills: Skill[] = [
   DropdownSkill,
 ];
 
+function compactSnapshot(snap: DOMSnapshot): string {
+  const kwPriority = /submit|reveal|show|close|dismiss|confirm|continue|next|code|unlock/i;
+  const prioritized = snap.clickables.filter((c) => kwPriority.test(c.text + c.ariaLabel));
+  const rest = snap.clickables.filter((c) => !kwPriority.test(c.text + c.ariaLabel));
+  const clickables = [...prioritized, ...rest].slice(0, 60);
+
+  const compact: Record<string, unknown> = {
+    url: snap.url,
+    stepHintText: snap.stepHintText,
+    codesFound: snap.codesFound,
+    activeDialogEid: snap.activeDialogEid,
+    dialogs: snap.dialogs.filter((d) => d.visible).slice(0, 3),
+    inputs: snap.inputs.slice(0, 25),
+    clickables,
+    scrollables: snap.scrollables.slice(0, 25),
+    features: snap.features,
+  };
+  return JSON.stringify(compact);
+}
+
 async function buildScoutActions(
   page: Page,
   config: AgentConfig,
   snap: DOMSnapshot
 ): Promise<AgentAction[]> {
-  const snapshotJson = clampText(JSON.stringify(snap), 4000);
+  const snapshotJson = compactSnapshot(snap);
   const img = await screenshot(page, "scout");
   const calls = [
     { prompt: `${MODAL_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
@@ -1022,14 +1091,11 @@ async function solveStep(
 
   const domCode = await checkForCode(page, triedCodes);
   if (domCode) {
-    const snap = await captureDOMSnapshot(page);
-    await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-    await submitCodeWithSnapshot(page, snap, domCode);
+    await submitCodeSafe(page, domCode, deadline);
     const verify = await verifyStep(page, stepNumber);
     if (verify.advanced || verify.completed) return { success: true };
     triedCodes.add(domCode);
     console.log(`  [STALE] code ${domCode} failed, added to triedCodes`);
-    await injectEIDs(page);
   }
 
   let snap = await captureDOMSnapshot(page);
@@ -1038,13 +1104,11 @@ async function solveStep(
     if (!withinDeadline(deadline)) break;
     const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt, triedCodes);
     if (result.code && !triedCodes.has(result.code)) {
-      await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-      await submitCodeWithSnapshot(page, snap, result.code);
+      await submitCodeSafe(page, result.code, deadline);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
       triedCodes.add(result.code);
       console.log(`  [STALE] code ${result.code} failed, added to triedCodes`);
-      await injectEIDs(page);
       snap = await captureDOMSnapshot(page);
       continue;
     }
@@ -1060,25 +1124,19 @@ async function solveStep(
       if (!withinDeadline(deadline)) break;
       if (action.type === "submit_code") {
         if (triedCodes.has(action.code)) continue;
-        await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-        await submitCodeWithSnapshot(page, snap, action.code);
+        await submitCodeSafe(page, action.code, deadline);
         const verify = await verifyStep(page, stepNumber);
         if (verify.advanced || verify.completed) return { success: true };
         triedCodes.add(action.code);
         console.log(`  [STALE] code ${action.code} failed, added to triedCodes`);
-        await injectEIDs(page);
-        snap = await captureDOMSnapshot(page);
       } else {
         const exec = await executeAction(page, action);
         if (exec.codeFound && !triedCodes.has(exec.codeFound)) {
-          await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-          await submitCodeWithSnapshot(page, snap, exec.codeFound);
+          await submitCodeSafe(page, exec.codeFound, deadline);
           const verify = await verifyStep(page, stepNumber);
           if (verify.advanced || verify.completed) return { success: true };
           triedCodes.add(exec.codeFound);
           console.log(`  [STALE] code ${exec.codeFound} failed, added to triedCodes`);
-          await injectEIDs(page);
-          snap = await captureDOMSnapshot(page);
         }
         if (exec.trapDetected) break;
       }
@@ -1097,9 +1155,7 @@ async function solveStep(
 
     if (parsed.code && parsed.code !== "NONE" && !triedCodes.has(parsed.code)) {
       try {
-        const latestSnap = await captureDOMSnapshot(page);
-        await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-        await submitCodeWithSnapshot(page, latestSnap, parsed.code);
+        await submitCodeSafe(page, parsed.code, deadline);
         const verify = await verifyStep(page, stepNumber);
         if (verify.advanced || verify.completed) return { success: true };
         triedCodes.add(parsed.code);
