@@ -138,7 +138,7 @@ interface ExecResult {
 interface Skill {
   id: string;
   match(snap: DOMSnapshot): boolean;
-  run(page: Page, snap: DOMSnapshot, deadline: number): Promise<SkillResult>;
+  run(page: Page, snap: DOMSnapshot, deadline: number, exclude?: Set<string>): Promise<SkillResult>;
 }
 
 interface SkillResult {
@@ -216,17 +216,18 @@ function clampText(text: string, maxLength: number): string {
   return text.slice(0, maxLength);
 }
 
-function pickCode(codes: Array<{ code: string; score: number }>): string | null {
+function pickCode(codes: Array<{ code: string; score: number }>, exclude?: Set<string>): string | null {
   const normalized = codes
     .map((c) => c.code.trim())
-    .filter((code) => /^[A-Za-z0-9]{6}$/.test(code));
+    .filter((code) => /^[A-Za-z0-9]{6}$/.test(code))
+    .filter((code) => !exclude || !exclude.has(code));
   if (normalized.length > 0) return normalized[0];
   return null;
 }
 
-async function checkForCode(page: Page): Promise<string | null> {
+async function checkForCode(page: Page, exclude?: Set<string>): Promise<string | null> {
   const codes = await extractCodesFromDOM(page);
-  return pickCode(codes);
+  return pickCode(codes, exclude);
 }
 
 async function detectTrap(page: Page): Promise<boolean> {
@@ -607,6 +608,7 @@ async function submitCodeWithSnapshot(
   code: string
 ): Promise<void> {
   const inputEid = selectInputEid(snap);
+  console.log(`  [SUBMIT] code="${code}" inputEid=${inputEid ?? "no input EID found"}`);
   if (inputEid) {
     const locator = page.locator(`[data-agent-eid="${inputEid}"]`);
     await locator.click({ timeout: 800 }).catch(() => undefined);
@@ -617,19 +619,25 @@ async function submitCodeWithSnapshot(
   }
 
   const submitEid = await selectSubmitButton(page, snap);
+  console.log(`  [SUBMIT] submitEid=${submitEid ?? "no submit EID found"}`);
   if (submitEid) {
     const submitLoc = page.locator(`[data-agent-eid="${submitEid}"]`);
     try {
       await submitLoc.click({ timeout: 800 });
+      console.log(`  [SUBMIT] click succeeded`);
     } catch {
+      console.log(`  [SUBMIT] click failed, dismissing overlays and retrying`);
       await dismissOverlays(page, now() + DISMISS_TIME_CAP_MS);
       try {
         await submitLoc.click({ timeout: 800 });
+        console.log(`  [SUBMIT] retry click succeeded`);
       } catch {
+        console.log(`  [SUBMIT] retry failed, pressing Enter fallback`);
         await page.keyboard.press("Enter");
       }
     }
   } else {
+    console.log(`  [SUBMIT] no submit button, pressing Enter`);
     await page.keyboard.press("Enter");
   }
 
@@ -696,7 +704,8 @@ async function runSkill(
   deadline: number,
   skill: Skill,
   stepNumber: number,
-  attempt: number
+  attempt: number,
+  exclude?: Set<string>
 ): Promise<SkillResult> {
   const start = now();
   let result: SkillResult = { code: null, actions_taken: 0, elapsed_ms: 0 };
@@ -705,7 +714,7 @@ async function runSkill(
     return result;
   }
 
-  result = await skill.run(page, snap, deadline);
+  result = await skill.run(page, snap, deadline, exclude);
 
   const log: SkillLog = {
     step: stepNumber,
@@ -724,8 +733,8 @@ async function runSkill(
 const DirectCodeSkill: Skill = {
   id: "direct_code",
   match: (snap) => snap.codesFound.length > 0,
-  run: async (_page, snap) => ({
-    code: snap.codesFound[0] ?? null,
+  run: async (_page, snap, _deadline, exclude) => ({
+    code: snap.codesFound.filter((c) => !exclude || !exclude.has(c))[0] ?? null,
     actions_taken: 0,
     elapsed_ms: 0,
   }),
@@ -1006,29 +1015,38 @@ async function solveStep(
 ): Promise<{ success: boolean; error?: string }>
 {
   const deadline = now() + STEP_DEADLINE_MS;
+  const triedCodes = new Set<string>();
 
   await injectEIDs(page);
   await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
 
-  const domCode = await checkForCode(page);
+  const domCode = await checkForCode(page, triedCodes);
   if (domCode) {
     const snap = await captureDOMSnapshot(page);
     await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
     await submitCodeWithSnapshot(page, snap, domCode);
     const verify = await verifyStep(page, stepNumber);
     if (verify.advanced || verify.completed) return { success: true };
+    triedCodes.add(domCode);
+    console.log(`  [STALE] code ${domCode} failed, added to triedCodes`);
+    await injectEIDs(page);
   }
 
   let snap = await captureDOMSnapshot(page);
 
   for (const skill of skills) {
     if (!withinDeadline(deadline)) break;
-    const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt);
-    if (result.code) {
+    const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt, triedCodes);
+    if (result.code && !triedCodes.has(result.code)) {
       await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
       await submitCodeWithSnapshot(page, snap, result.code);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
+      triedCodes.add(result.code);
+      console.log(`  [STALE] code ${result.code} failed, added to triedCodes`);
+      await injectEIDs(page);
+      snap = await captureDOMSnapshot(page);
+      continue;
     }
     if (!withinDeadline(deadline)) break;
     snap = await captureDOMSnapshot(page);
@@ -1041,18 +1059,29 @@ async function solveStep(
     for (const action of scoutActions) {
       if (!withinDeadline(deadline)) break;
       if (action.type === "submit_code") {
+        if (triedCodes.has(action.code)) continue;
         await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
         await submitCodeWithSnapshot(page, snap, action.code);
+        const verify = await verifyStep(page, stepNumber);
+        if (verify.advanced || verify.completed) return { success: true };
+        triedCodes.add(action.code);
+        console.log(`  [STALE] code ${action.code} failed, added to triedCodes`);
+        await injectEIDs(page);
+        snap = await captureDOMSnapshot(page);
       } else {
         const exec = await executeAction(page, action);
-        if (exec.codeFound) {
+        if (exec.codeFound && !triedCodes.has(exec.codeFound)) {
           await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
           await submitCodeWithSnapshot(page, snap, exec.codeFound);
+          const verify = await verifyStep(page, stepNumber);
+          if (verify.advanced || verify.completed) return { success: true };
+          triedCodes.add(exec.codeFound);
+          console.log(`  [STALE] code ${exec.codeFound} failed, added to triedCodes`);
+          await injectEIDs(page);
+          snap = await captureDOMSnapshot(page);
         }
         if (exec.trapDetected) break;
       }
-      const verify = await verifyStep(page, stepNumber);
-      if (verify.advanced || verify.completed) return { success: true };
     }
   }
 
@@ -1066,13 +1095,15 @@ async function solveStep(
       256
     );
 
-    if (parsed.code && parsed.code !== "NONE") {
+    if (parsed.code && parsed.code !== "NONE" && !triedCodes.has(parsed.code)) {
       try {
         const latestSnap = await captureDOMSnapshot(page);
         await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
         await submitCodeWithSnapshot(page, latestSnap, parsed.code);
         const verify = await verifyStep(page, stepNumber);
         if (verify.advanced || verify.completed) return { success: true };
+        triedCodes.add(parsed.code);
+        console.log(`  [STALE] code ${parsed.code} failed, added to triedCodes`);
       } catch {
         console.log(`  [WARN] Vision fallback submit failed for step ${stepNumber}`);
       }
