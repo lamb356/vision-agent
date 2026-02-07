@@ -235,270 +235,246 @@ async function detectTrap(page: Page): Promise<boolean> {
 }
 
 async function getActiveDialogEid(page: Page): Promise<string | null> {
-  return page.evaluate(() => {
-    const dialogSelectors = [
-      '[role="dialog"]',
-      '.modal',
-      '[class*="modal"]',
-      '[class*="dialog"]',
-      '.overlay',
-      '.popup',
+  return page.evaluate(`(function() {
+    var dialogSelectors = [
+      '[role="dialog"]', '.modal', '[class*="modal"]',
+      '[class*="dialog"]', '.overlay', '.popup'
     ];
-    const candidates = Array.from(
-      document.querySelectorAll<HTMLElement>(dialogSelectors.join(","))
-    ).filter((el) => el.getAttribute("data-agent-eid"));
-
-    const visible = candidates.filter((el) => {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        style.opacity !== "0"
-      );
+    var candidates = Array.from(
+      document.querySelectorAll(dialogSelectors.join(","))
+    ).filter(function(el) { return el.getAttribute("data-agent-eid"); });
+    var visible = candidates.filter(function(el) {
+      var style = window.getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== "none" && style.visibility !== "hidden" &&
+        style.opacity !== "0";
     });
-
     if (visible.length === 0) return null;
-
-    const sorted = visible.sort((a, b) => {
-      const za = Number(window.getComputedStyle(a).zIndex || 0);
-      const zb = Number(window.getComputedStyle(b).zIndex || 0);
+    var sorted = visible.sort(function(a, b) {
+      var za = Number(window.getComputedStyle(a).zIndex || 0);
+      var zb = Number(window.getComputedStyle(b).zIndex || 0);
       return zb - za;
     });
-
-    return sorted[0]?.getAttribute("data-agent-eid") || null;
-  });
+    return sorted[0] ? sorted[0].getAttribute("data-agent-eid") : null;
+  })()`) as Promise<string | null>;
 }
 
 async function injectEIDs(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const selectors = [
-      'button',
-      'a',
-      '[role="button"]',
-      'input[type="submit"]',
-      'input[type="button"]',
-      'input',
-      'select',
-      'textarea',
-      '[role="dialog"]',
-      '.modal',
-      '[class*="modal"]',
-      '[class*="dialog"]',
-      '.overlay',
-      '.popup',
-      '[onclick]',
+  return page.evaluate(`(function() {
+    var selectors = [
+      'button', 'a', '[role="button"]', 'input[type="submit"]',
+      'input[type="button"]', 'input', 'select', 'textarea',
+      '[role="dialog"]', '.modal', '[class*="modal"]', '[class*="dialog"]',
+      '.overlay', '.popup', '[onclick]'
     ];
-
-    const elements = new Set<HTMLElement>();
-    selectors.forEach((sel) => {
-      document.querySelectorAll<HTMLElement>(sel).forEach((el) => elements.add(el));
+    var elements = new Set();
+    selectors.forEach(function(sel) {
+      document.querySelectorAll(sel).forEach(function(el) { elements.add(el); });
     });
-
-    document.querySelectorAll<HTMLElement>("*").forEach((el) => {
-      if (el.scrollHeight > el.clientHeight + 20) {
-        elements.add(el);
-      }
+    document.querySelectorAll("*").forEach(function(el) {
+      if (el.scrollHeight > el.clientHeight + 20) { elements.add(el); }
     });
-
-    let count = 0;
-    elements.forEach((el) => {
+    var count = 0;
+    elements.forEach(function(el) {
       count += 1;
-      const eid = `E${String(count).padStart(3, "0")}`;
+      var eid = "E" + String(count).padStart(3, "0");
       el.setAttribute("data-agent-eid", eid);
     });
-
     return count;
-  });
+  })()`) as Promise<number>;
 }
+
+// String-based evaluate to avoid tsx injecting __name helpers into the browser context
+const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
+  var dialogSelectors = [
+    '[role="dialog"]',
+    '.modal',
+    '[class*="modal"]',
+    '[class*="dialog"]',
+    '.overlay',
+    '.popup'
+  ];
+
+  var buttonSelectors = [
+    'button',
+    '[role="button"]',
+    'input[type="button"]',
+    'input[type="submit"]',
+    'a'
+  ];
+
+  function isVisible(el) {
+    var style = window.getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0"
+    );
+  }
+
+  function textOf(el) {
+    if (!el) return "";
+    return (el.innerText || el.textContent || "").trim();
+  }
+
+  function truncate(text, maxLen) {
+    return text.length > maxLen ? text.slice(0, maxLen) : text;
+  }
+
+  var dialogElements = Array.from(
+    document.querySelectorAll(dialogSelectors.join(","))
+  ).filter(function(el) { return el.getAttribute("data-agent-eid"); });
+
+  var visibleDialogs = dialogElements.filter(isVisible);
+
+  var sortedDialogs = visibleDialogs.slice().sort(function(a, b) {
+    var za = Number(window.getComputedStyle(a).zIndex || 0);
+    var zb = Number(window.getComputedStyle(b).zIndex || 0);
+    return zb - za;
+  });
+
+  var activeDialogEid = sortedDialogs[0] ? sortedDialogs[0].getAttribute("data-agent-eid") : null;
+
+  var dialogs = dialogElements.map(function(dialog) {
+    var eid = dialog.getAttribute("data-agent-eid") || "";
+    var buttons = Array.from(
+      dialog.querySelectorAll(buttonSelectors.join(","))
+    )
+      .filter(function(btn) { return btn.getAttribute("data-agent-eid"); })
+      .map(function(btn) {
+        return {
+          eid: btn.getAttribute("data-agent-eid") || "",
+          text: truncate(textOf(btn), 60)
+        };
+      });
+
+    var radios = dialog.querySelectorAll('input[type="radio"]').length;
+    var checkboxes = dialog.querySelectorAll('input[type="checkbox"]').length;
+    var selects = dialog.querySelectorAll('select').length;
+
+    return {
+      eid: eid,
+      visible: isVisible(dialog),
+      scrollable: dialog.scrollHeight > dialog.clientHeight + 20,
+      textExcerpt: truncate(textOf(dialog), 300),
+      radioCount: radios,
+      checkboxCount: checkboxes,
+      selectCount: selects,
+      buttons: buttons
+    };
+  });
+
+  var inputs = Array.from(
+    document.querySelectorAll('input, select, textarea')
+  )
+    .filter(function(el) { return el.getAttribute("data-agent-eid"); })
+    .map(function(el) {
+      var tag = el.tagName.toLowerCase();
+      var kind = tag === "input" ? (el.type || "text") : tag;
+      return {
+        eid: el.getAttribute("data-agent-eid") || "",
+        kind: kind,
+        placeholder: truncate(
+          (el.placeholder || el.getAttribute("aria-label") || ""),
+          80
+        )
+      };
+    });
+
+  var clickables = Array.from(
+    document.querySelectorAll(buttonSelectors.join(","))
+  )
+    .filter(function(el) { return el.getAttribute("data-agent-eid"); })
+    .map(function(el) {
+      var parent = el.parentElement;
+      var inDialog = null;
+      while (parent) {
+        if (dialogSelectors.some(function(sel) { return parent && parent.matches(sel); })) {
+          inDialog = parent.getAttribute("data-agent-eid");
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      return {
+        eid: el.getAttribute("data-agent-eid") || "",
+        tag: el.tagName.toLowerCase(),
+        text: truncate(textOf(el), 80),
+        ariaLabel: truncate(el.getAttribute("aria-label") || "", 80),
+        inDialog: inDialog
+      };
+    });
+
+  var scrollables = Array.from(document.querySelectorAll("*"))
+    .filter(function(el) { return el.getAttribute("data-agent-eid"); })
+    .filter(function(el) { return el.scrollHeight > el.clientHeight + 20; })
+    .map(function(el) {
+      var parent = el.parentElement;
+      var inDialog = null;
+      while (parent) {
+        if (dialogSelectors.some(function(sel) { return parent && parent.matches(sel); })) {
+          inDialog = parent.getAttribute("data-agent-eid");
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      return { eid: el.getAttribute("data-agent-eid") || "", inDialog: inDialog };
+    });
+
+  var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 800);
+  var hasCodeVisible = /[A-Za-z0-9]{6}/.test(bodyText);
+  var hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
+  var hasClickHereText = /(click here|click\\s+\\d+\\s+times)/i.test(bodyText);
+
+  return {
+    url: window.location.href,
+    stepHintText: truncate(bodyText, 200),
+    activeDialogEid: activeDialogEid,
+    dialogs: dialogs,
+    inputs: inputs,
+    clickables: clickables,
+    scrollables: scrollables,
+    features: {
+      hasDialog: visibleDialogs.length > 0,
+      hasRadios: document.querySelectorAll('input[type="radio"]').length > 0,
+      hasCheckboxes: document.querySelectorAll('input[type="checkbox"]').length > 0,
+      hasSelects: document.querySelectorAll('select').length > 0,
+      hasScrollable: scrollables.length > 0,
+      hasRevealText: hasRevealText,
+      hasClickHereText: hasClickHereText,
+      hasCodeVisible: hasCodeVisible,
+      totalButtons: document.querySelectorAll(buttonSelectors.join(",")).length,
+      totalInputs: document.querySelectorAll('input, select, textarea').length
+    }
+  };
+})()`;
 
 async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
   const codesFound = await extractCodesFromDOM(page);
   const codeList = codesFound.map((c) => c.code).filter((code) => code.length > 0);
 
-  const snapshot = await page.evaluate(() => {
-    const dialogSelectors = [
-      '[role="dialog"]',
-      '.modal',
-      '[class*="modal"]',
-      '[class*="dialog"]',
-      '.overlay',
-      '.popup',
-    ];
-
-    const buttonSelectors = [
-      'button',
-      '[role="button"]',
-      'input[type="button"]',
-      'input[type="submit"]',
-      'a',
-    ];
-
-    const isVisible = (el: HTMLElement) => {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        style.opacity !== "0"
-      );
-    };
-
-    const textOf = (el: HTMLElement | null) => {
-      if (!el) return "";
-      return (el.innerText || el.textContent || "").trim();
-    };
-
-    const truncate = (text: string, maxLen: number) =>
-      text.length > maxLen ? text.slice(0, maxLen) : text;
-
-    const dialogElements = Array.from(
-      document.querySelectorAll<HTMLElement>(dialogSelectors.join(","))
-    ).filter((el) => el.getAttribute("data-agent-eid"));
-
-    const visibleDialogs = dialogElements.filter(isVisible);
-
-    const sortedDialogs = [...visibleDialogs].sort((a, b) => {
-      const za = Number(window.getComputedStyle(a).zIndex || 0);
-      const zb = Number(window.getComputedStyle(b).zIndex || 0);
-      return zb - za;
-    });
-
-    const activeDialogEid =
-      sortedDialogs[0]?.getAttribute("data-agent-eid") ?? null;
-
-    const dialogs = dialogElements.map((dialog) => {
-      const eid = dialog.getAttribute("data-agent-eid") || "";
-      const buttons = Array.from(
-        dialog.querySelectorAll<HTMLElement>(buttonSelectors.join(","))
-      )
-        .filter((btn) => btn.getAttribute("data-agent-eid"))
-        .map((btn) => ({
-          eid: btn.getAttribute("data-agent-eid") || "",
-          text: truncate(textOf(btn), 60),
-        }));
-
-      const radios = dialog.querySelectorAll('input[type="radio"]').length;
-      const checkboxes = dialog.querySelectorAll('input[type="checkbox"]').length;
-      const selects = dialog.querySelectorAll('select').length;
-
-      return {
-        eid,
-        visible: isVisible(dialog),
-        scrollable: dialog.scrollHeight > dialog.clientHeight + 20,
-        textExcerpt: truncate(textOf(dialog), 300),
-        radioCount: radios,
-        checkboxCount: checkboxes,
-        selectCount: selects,
-        buttons,
-      };
-    });
-
-    const inputs = Array.from(
-      document.querySelectorAll<HTMLElement>('input, select, textarea')
-    )
-      .filter((el) => el.getAttribute("data-agent-eid"))
-      .map((el) => {
-        const tag = el.tagName.toLowerCase();
-        const kind = tag === "input" ? (el as HTMLInputElement).type || "text" : tag;
-        return {
-          eid: el.getAttribute("data-agent-eid") || "",
-          kind,
-          placeholder: truncate(
-            (el as HTMLInputElement).placeholder || el.getAttribute("aria-label") || "",
-            80
-          ),
-        };
-      });
-
-    const clickables = Array.from(
-      document.querySelectorAll<HTMLElement>(buttonSelectors.join(","))
-    )
-      .filter((el) => el.getAttribute("data-agent-eid"))
-      .map((el) => {
-        let parent = el.parentElement;
-        let inDialog: string | null = null;
-        while (parent) {
-          if (dialogSelectors.some((sel) => parent?.matches(sel))) {
-            inDialog = parent.getAttribute("data-agent-eid");
-            break;
-          }
-          parent = parent.parentElement;
-        }
-        return {
-          eid: el.getAttribute("data-agent-eid") || "",
-          tag: el.tagName.toLowerCase(),
-          text: truncate(textOf(el), 80),
-          ariaLabel: truncate(el.getAttribute("aria-label") || "", 80),
-          inDialog,
-        };
-      });
-
-    const scrollables = Array.from(document.querySelectorAll<HTMLElement>("*"))
-      .filter((el) => el.getAttribute("data-agent-eid"))
-      .filter((el) => el.scrollHeight > el.clientHeight + 20)
-      .map((el) => {
-        let parent = el.parentElement;
-        let inDialog: string | null = null;
-        while (parent) {
-          if (dialogSelectors.some((sel) => parent?.matches(sel))) {
-            inDialog = parent.getAttribute("data-agent-eid");
-            break;
-          }
-          parent = parent.parentElement;
-        }
-        return { eid: el.getAttribute("data-agent-eid") || "", inDialog };
-      });
-
-    const bodyText = truncate((document.body?.innerText || "").trim(), 800);
-    const hasCodeVisible = /[A-Za-z0-9]{6}/.test(bodyText);
-    const hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
-    const hasClickHereText = /(click here|click\s+\d+\s+times)/i.test(bodyText);
-
-    return {
-      url: window.location.href,
-      stepHintText: truncate(bodyText, 200),
-      activeDialogEid,
-      dialogs,
-      inputs,
-      clickables,
-      scrollables,
-      features: {
-        hasDialog: visibleDialogs.length > 0,
-        hasRadios: document.querySelectorAll('input[type="radio"]').length > 0,
-        hasCheckboxes: document.querySelectorAll('input[type="checkbox"]').length > 0,
-        hasSelects: document.querySelectorAll('select').length > 0,
-        hasScrollable: scrollables.length > 0,
-        hasRevealText,
-        hasClickHereText,
-        hasCodeVisible,
-        totalButtons: document.querySelectorAll(buttonSelectors.join(",")).length,
-        totalInputs: document.querySelectorAll('input, select, textarea').length,
-      },
-    };
-  });
+  const snapshot = await page.evaluate(CAPTURE_DOM_SNAPSHOT_SCRIPT) as any;
 
   return {
     ...snapshot,
     codesFound: codeList,
     stepHintText: clampText(snapshot.stepHintText, 200),
-    dialogs: snapshot.dialogs.map((d) => ({
+    dialogs: snapshot.dialogs.map((d: any) => ({
       ...d,
       textExcerpt: clampText(d.textExcerpt, 300),
-      buttons: d.buttons.map((b) => ({
+      buttons: d.buttons.map((b: any) => ({
         ...b,
         text: clampText(b.text, 60),
       })),
     })),
-    inputs: snapshot.inputs.map((i) => ({
+    inputs: snapshot.inputs.map((i: any) => ({
       ...i,
       placeholder: clampText(i.placeholder, 80),
     })),
-    clickables: snapshot.clickables.map((c) => ({
+    clickables: snapshot.clickables.map((c: any) => ({
       ...c,
       text: clampText(c.text, 80),
       ariaLabel: clampText(c.ariaLabel, 80),
@@ -530,12 +506,10 @@ async function executeAction(page: Page, action: AgentAction): Promise<ExecResul
         .locator(`[data-agent-eid="${action.eid}"]`)
         .selectOption({ index: action.index });
     } else if (action.type === "scroll_eid_to_bottom") {
-      await page.evaluate((eid) => {
-        const el = document.querySelector<HTMLElement>(`[data-agent-eid="${eid}"]`);
-        if (el) {
-          el.scrollTop = el.scrollHeight;
-        }
-      }, action.eid);
+      await page.evaluate(`(function(eid) {
+        var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+        if (el) { el.scrollTop = el.scrollHeight; }
+      })("${action.eid}")`);
     } else if (action.type === "press_key") {
       await page.keyboard.press(action.key);
     } else if (action.type === "submit_code") {
@@ -649,7 +623,7 @@ async function submitCodeWithSnapshot(
 }
 
 async function verifyStep(page: Page, expectedStep: number): Promise<VerifyResult> {
-  const bodyText = await page.evaluate(() => document.body?.innerText || "");
+  const bodyText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
   const match = bodyText.match(/Step\s+(\d+)\s+of\s+30/i);
   const current_step = match ? Number(match[1]) : expectedStep;
   const completed = /(congratulations|completed|well done)/i.test(bodyText);
@@ -665,35 +639,35 @@ async function getRadioOptionsInDialog(
   page: Page,
   dialogEid: string
 ): Promise<Array<{ eid: string; label: string }>> {
-  return page.evaluate((eid) => {
-    const dialog = document.querySelector<HTMLElement>(`[data-agent-eid="${eid}"]`);
+  return page.evaluate(`(function() {
+    var dialog = document.querySelector('[data-agent-eid="${dialogEid}"]');
     if (!dialog) return [];
-    const radios = Array.from(dialog.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
-      .filter((radio) => radio.getAttribute("data-agent-eid"))
-      .map((radio) => {
-        let labelText = "";
+    var radios = Array.from(dialog.querySelectorAll('input[type="radio"]'))
+      .filter(function(radio) { return radio.getAttribute("data-agent-eid"); })
+      .map(function(radio) {
+        var labelText = "";
         if (radio.id) {
-          const label = dialog.querySelector(`label[for="${radio.id}"]`);
+          var label = dialog.querySelector('label[for="' + radio.id + '"]');
           if (label) labelText = (label.textContent || "").trim();
         }
         if (!labelText) {
-          const parentLabel = radio.closest("label");
+          var parentLabel = radio.closest("label");
           if (parentLabel) labelText = (parentLabel.textContent || "").trim();
         }
         return {
           eid: radio.getAttribute("data-agent-eid") || "",
-          label: labelText,
+          label: labelText
         };
       });
     return radios;
-  }, dialogEid);
+  })()`) as Promise<Array<{ eid: string; label: string }>>;
 }
 
 async function selectLastOption(page: Page, eid: string): Promise<void> {
-  const count = await page.evaluate((eidValue) => {
-    const select = document.querySelector<HTMLSelectElement>(`[data-agent-eid="${eidValue}"]`);
-    return select?.options?.length ?? 0;
-  }, eid);
+  const count = await page.evaluate(`(function() {
+    var select = document.querySelector('[data-agent-eid="${eid}"]');
+    return select && select.options ? select.options.length : 0;
+  })()`) as number;
 
   if (count > 0) {
     await page
@@ -873,7 +847,7 @@ const ClickHereSkill: Skill = {
     const start = now();
     let actions = 0;
 
-    const bodyText = await page.evaluate(() => document.body?.innerText || "");
+    const bodyText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
     const match = bodyText.match(/click\s+(\d+)\s+times/i);
     const clickCount = match ? Math.min(Number(match[1]), 6) : 3;
 
