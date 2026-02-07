@@ -1,20 +1,23 @@
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import type {
   AgentConfig,
   Coordinate,
   CodeResult,
+  CombinedResult,
   SubmitTargets,
   VerifyResult,
   PageAnalysis,
   StepResult,
 } from "./types.js";
-import { callGemini } from "./gemini.js";
+import { callGemini, callGeminiParallel } from "./gemini.js";
 import {
   CODE_PROMPT,
+  COMBINED_PROMPT,
   SUBMIT_TARGETS_PROMPT,
   START_PROMPT,
   ANALYZE_PAGE_PROMPT,
   submitTargetsWithFailedPrompt,
+  combinedSchema,
   codeSchema,
   submitTargetsSchema,
   startSchema,
@@ -31,7 +34,7 @@ import {
   scrollInModal,
 } from "./browser.js";
 
-const MAX_DISTRACTOR_ROUNDS = 3;
+const MAX_DISTRACTOR_ROUNDS = 5;
 const MAX_STEP_ATTEMPTS = 5;
 
 interface StartResult {
@@ -121,35 +124,25 @@ async function dismissDistractors(
   page: Page,
   _config: AgentConfig
 ): Promise<void> {
-  // Ordered by priority: most specific first
+  // SAFE selectors only — no has-text selectors (they match decoy trap buttons)
   const dismissSelectors = [
-    // Cookie consent
-    'button:has-text("Accept")',
-    'button:has-text("Accept All")',
-    'button:has-text("Got it")',
-    'button:has-text("I Agree")',
-    'button:has-text("Agree")',
-    // Dismiss/close
-    'button:has-text("Dismiss")',
-    'button:has-text("Close")',
-    'button:has-text("OK")',
-    'button:has-text("×")',
-    'button:has-text("✕")',
-    'button:has-text("X")',
-    // ARIA / class based
     '[aria-label="Close"]',
     '[aria-label="Dismiss"]',
     '[aria-label="close"]',
+    '[aria-label*="close" i]',
+    '[aria-label*="dismiss" i]',
+    '[aria-label*="exit" i]',
     '.close-button',
     '.close-btn',
     '.dismiss-button',
     '.dismiss-btn',
     '.modal-close',
     '.btn-close',
-    // Generic close icons (often an X in a corner)
     'button.close',
     '[data-dismiss="modal"]',
     '[data-bs-dismiss="modal"]',
+    '[data-dismiss]',
+    '[data-bs-dismiss]',
   ];
 
   for (let round = 0; round < MAX_DISTRACTOR_ROUNDS; round++) {
@@ -165,7 +158,7 @@ async function dismissDistractors(
             await loc.click({ timeout: 500 });
             dismissed++;
             console.log(`    DOM dismiss: ${sel}`);
-            await waitForStability(page, 200);
+            await waitForStability(page, 100);
           }
         } catch { /* element may have disappeared */ }
       }
@@ -173,7 +166,7 @@ async function dismissDistractors(
 
     // Also press Escape
     await pressEscape(page);
-    await waitForStability(page, 200);
+    await waitForStability(page, 100);
 
     if (dismissed === 0) {
       console.log(`  Distractors clear (round ${round + 1})`);
@@ -219,7 +212,7 @@ async function tryExtractCode(
     CODE_PROMPT,
     img,
     codeSchema,
-    1024
+    0
   );
 
   if (parsed.code !== "NONE" && parsed.code.length === 6) {
@@ -243,9 +236,10 @@ async function domClick(page: Page, textHints: string[]): Promise<boolean> {
     try {
       const loc = page.getByRole("button", { name: hint, exact: false });
       if (await loc.first().isVisible({ timeout: 300 }).catch(() => false)) {
+        await loc.first().click({ timeout: 1000, trial: true });
         await loc.first().click({ timeout: 1000 });
         console.log(`    DOM click (role): "${hint}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -254,9 +248,10 @@ async function domClick(page: Page, textHints: string[]): Promise<boolean> {
     try {
       const loc = page.getByText(hint, { exact: false }).first();
       if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+        await loc.click({ timeout: 1000, trial: true });
         await loc.click({ timeout: 1000 });
         console.log(`    DOM click (text): "${hint}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -265,9 +260,10 @@ async function domClick(page: Page, textHints: string[]): Promise<boolean> {
     try {
       const loc = page.locator(`button:has-text("${hint}")`).first();
       if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+        await loc.click({ timeout: 1000, trial: true });
         await loc.click({ timeout: 1000 });
         console.log(`    DOM click (css-button): "${hint}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -276,9 +272,10 @@ async function domClick(page: Page, textHints: string[]): Promise<boolean> {
     try {
       const loc = page.locator(`[role="button"]:has-text("${hint}")`).first();
       if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+        await loc.click({ timeout: 1000, trial: true });
         await loc.click({ timeout: 1000 });
         console.log(`    DOM click (css-role): "${hint}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -287,9 +284,10 @@ async function domClick(page: Page, textHints: string[]): Promise<boolean> {
     try {
       const loc = page.getByRole("link", { name: hint, exact: false });
       if (await loc.first().isVisible({ timeout: 300 }).catch(() => false)) {
+        await loc.first().click({ timeout: 1000, trial: true });
         await loc.first().click({ timeout: 1000 });
         console.log(`    DOM click (link): "${hint}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -320,7 +318,7 @@ async function domSelectRadio(page: Page, description: string): Promise<boolean>
       if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
         await loc.click({ timeout: 1000 });
         console.log(`    DOM radio (correct): ${sel}`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -338,7 +336,7 @@ async function domSelectRadio(page: Page, description: string): Promise<boolean>
       if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
         await loc.click({ timeout: 1000 });
         console.log(`    DOM radio (hint): ${sel}`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* not found */ }
@@ -361,7 +359,7 @@ async function domSelectRadio(page: Page, description: string): Promise<boolean>
       if (lower.includes("correct") || lower.includes("option b") || lower.includes("right")) {
         await radio.click({ timeout: 1000 });
         console.log(`    DOM radio selected: "${labelText}"`);
-        await waitForStability(page, 300);
+        await waitForStability(page, 150);
         return true;
       }
     } catch { /* skip */ }
@@ -372,7 +370,7 @@ async function domSelectRadio(page: Page, description: string): Promise<boolean>
     try {
       await radios.nth(1).click({ timeout: 1000 });
       console.log(`    DOM radio fallback: clicked radio[1] of ${radioCount}`);
-      await waitForStability(page, 300);
+      await waitForStability(page, 150);
       return true;
     } catch { /* skip */ }
   }
@@ -412,36 +410,220 @@ async function domScrollModal(page: Page, direction: "down" | "up" = "down"): Pr
 
   if (scrolled) {
     console.log(`    DOM scroll modal: ${direction}`);
-    await waitForStability(page, 400);
+    await waitForStability(page, 250);
   }
   return scrolled;
 }
 
-/**
- * Analyze page with vision model, then execute actions via DOM selectors.
- * Vision tells us WHAT to do. DOM selectors EXECUTE it reliably.
- */
-async function analyzeAndInteract(
-  page: Page,
-  config: AgentConfig,
-  stepNumber: number,
-  round: number
-): Promise<PageAnalysis> {
-  const img = await screenshot(page, `step${stepNumber}-analyze-r${round}`);
-  const { parsed: analysis } = await callGemini<PageAnalysis>(
-    config.apiKey,
-    ANALYZE_PAGE_PROMPT,
-    img,
-    analyzePageSchema,
-    2048
-  );
+async function getActiveDialog(page: Page): Promise<Locator | null> {
+  const dialogSelector = [
+    '[role="dialog"]',
+    '.modal',
+    '[class*="modal"]',
+    '[class*="dialog"]',
+    '.overlay',
+    '.popup',
+  ].join(", ");
 
+  const dialogs = page.locator(dialogSelector);
+  const count = await dialogs.count().catch(() => 0);
+  if (count === 0) {
+    return null;
+  }
+
+  let bestIndex = -1;
+  let bestScore = -1;
+  for (let i = 0; i < count; i++) {
+    const loc = dialogs.nth(i);
+    const visible = await loc.isVisible({ timeout: 100 }).catch(() => false);
+    if (!visible) continue;
+    const metrics = await loc.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      const zIndex = parseInt(style.zIndex || "0", 10);
+      const area = rect.width * rect.height;
+      return {
+        zIndex: Number.isFinite(zIndex) ? zIndex : 0,
+        area,
+      };
+    });
+    const score = metrics.zIndex * 1_000_000 + metrics.area;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  if (bestIndex === -1) {
+    return null;
+  }
+
+  return dialogs.nth(bestIndex);
+}
+
+async function scrollAllScrollables(root: Locator, maxSweeps: number): Promise<boolean> {
+  let anyChanged = false;
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
+    const changed = await root.evaluate((el) => {
+      const nodes = Array.from(el.querySelectorAll<HTMLElement>("*"));
+      let didScroll = false;
+      for (const node of nodes) {
+        const style = window.getComputedStyle(node);
+        if ((style.overflowY === "auto" || style.overflowY === "scroll") &&
+            node.scrollHeight > node.clientHeight + 5) {
+          const before = node.scrollTop;
+          node.scrollTop = node.scrollHeight;
+          if (node.scrollTop !== before) {
+            didScroll = true;
+          }
+        }
+      }
+      return didScroll;
+    });
+    anyChanged = anyChanged || changed;
+    if (!changed) break;
+    await waitForStability(root.page(), 100);
+  }
+  return anyChanged;
+}
+
+async function clickSubmitInDialog(dialog: Locator, page: Page, deadline: number): Promise<boolean> {
+  if (Date.now() >= deadline) return false;
+
+  const submitLocators = [
+    dialog.getByRole("button", { name: /submit|continue|next|confirm|proceed|done|ok/i }),
+    dialog.locator('button:has-text("Submit"), button:has-text("Continue"), button:has-text("Next")'),
+    dialog.locator('input[type="submit"], button[type="submit"]'),
+  ];
+
+  for (const loc of submitLocators) {
+    if (Date.now() >= deadline) return false;
+    try {
+      if (await loc.first().isVisible({ timeout: 150 }).catch(() => false)) {
+        await loc.first().click({ timeout: 800 });
+        console.log("    Dialog submit clicked");
+        await waitForStability(page, 150);
+        return !await dialog.isVisible({ timeout: 150 }).catch(() => false);
+      }
+    } catch { /* try next */ }
+  }
+
+  try {
+    const anyButton = dialog.locator('button, [role="button"], input[type="submit"], input[type="button"], a').first();
+    if (await anyButton.isVisible({ timeout: 150 }).catch(() => false)) {
+      await anyButton.click({ timeout: 800 }).catch(() => {});
+      console.log("    Dialog fallback button clicked");
+      await waitForStability(page, 150);
+      return !await dialog.isVisible({ timeout: 150 }).catch(() => false);
+    }
+  } catch { /* no-op */ }
+
+  try {
+    await page.keyboard.press("Enter");
+    await waitForStability(page, 150);
+  } catch { /* no-op */ }
+
+  return !await dialog.isVisible({ timeout: 150 }).catch(() => false);
+}
+
+async function solveRadioModalBruteforce(page: Page, deadline: number): Promise<boolean> {
+  const dialog = await getActiveDialog(page);
+  if (!dialog) return false;
+
+  console.log("  Radio modal detected, attempting brute-force solve");
+  await scrollAllScrollables(dialog, 6);
+
+  const correctSelectors = [
+    'label:has-text("Correct") input[type="radio"]',
+    'label:has-text("correct") input[type="radio"]',
+    'input[type="radio"][value*="correct" i]',
+    'label:has-text("Correct")',
+    'label:has-text("correct")',
+  ];
+
+  for (const sel of correctSelectors) {
+    if (Date.now() >= deadline) return false;
+    const loc = dialog.locator(sel).first();
+    if (await loc.isVisible({ timeout: 150 }).catch(() => false)) {
+      await loc.click({ timeout: 800 }).catch(() => {});
+      console.log(`    Dialog radio selected via: ${sel}`);
+      if (await clickSubmitInDialog(dialog, page, deadline)) return true;
+      const code = await domOnlyCodeCheck(page);
+      if (code) return true;
+    }
+  }
+
+  const radios = dialog.locator('input[type="radio"]');
+  const radioCount = await radios.count().catch(() => 0);
+  for (let i = 0; i < radioCount; i++) {
+    if (Date.now() >= deadline) return false;
+    const radio = radios.nth(i);
+    if (!await radio.isVisible({ timeout: 150 }).catch(() => false)) {
+      continue;
+    }
+    await radio.click({ timeout: 800 }).catch(() => {});
+    console.log(`    Dialog radio clicked index=${i}`);
+    if (await clickSubmitInDialog(dialog, page, deadline)) return true;
+    const code = await domOnlyCodeCheck(page);
+    if (code) return true;
+  }
+
+  return false;
+}
+
+async function actionSpaceExplorer(page: Page, deadline: number): Promise<string | null> {
+  const clickable = page.locator('button, [role="button"], a, input[type="button"], input[type="submit"]');
+  const count = await clickable.count().catch(() => 0);
+  if (count === 0) return null;
+
+  const candidates: Array<{ index: number; score: number; text: string }> = [];
+  for (let i = 0; i < count; i++) {
+    if (Date.now() >= deadline) break;
+    const loc = clickable.nth(i);
+    const visible = await loc.isVisible({ timeout: 100 }).catch(() => false);
+    if (!visible) continue;
+    const text = (await loc.textContent().catch(() => ""))?.trim() ?? "";
+    const lower = text.toLowerCase();
+    if (lower.includes("close") || lower.includes("dismiss") || lower.includes("accept") || lower.includes("got it")) {
+      continue;
+    }
+    let score = 0;
+    if (/reveal|show|code/.test(lower)) score += 50;
+    if (/submit|continue|next|confirm|proceed|done/.test(lower)) score += 30;
+    if (lower.length > 0) score += Math.min(lower.length, 20);
+    candidates.push({ index: i, score, text });
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  for (const candidate of candidates) {
+    if (Date.now() >= deadline) break;
+    const loc = clickable.nth(candidate.index);
+    if (!await loc.isVisible({ timeout: 100 }).catch(() => false)) {
+      continue;
+    }
+    console.log(`    Action explorer click: "${candidate.text || "unnamed"}"`);
+    await loc.click({ timeout: 800 }).catch(() => {});
+    await waitForStability(page, 120);
+    const code = await domOnlyCodeCheck(page);
+    if (code) return code;
+  }
+
+  return null;
+}
+
+/**
+ * Execute vision-recommended actions via DOM selectors.
+ */
+async function executeAnalysisActions(
+  page: Page,
+  analysis: PageAnalysis
+): Promise<void> {
   console.log(`  Page: ${analysis.page_description}`);
   console.log(`  Modal: ${analysis.has_modal} | Code visible: ${analysis.has_code_visible} | Elements: ${analysis.interactive_elements}`);
 
   if (analysis.recommended_actions.length === 0) {
     console.log(`  No recommended actions`);
-    return analysis;
+    return;
   }
 
   // Execute actions using DOM selectors (not coordinates)
@@ -450,15 +632,13 @@ async function analyzeAndInteract(
 
     switch (action.action) {
       case "click": {
-        // Extract button text from the description
         const desc = action.description;
         const hints = extractButtonHints(desc);
         const clicked = await domClick(page, hints);
         if (!clicked) {
-          // Fallback to coordinate click
           console.log(`    DOM click failed, falling back to coords (${action.target.x},${action.target.y})`);
           await clickAt(page, action.target.x, action.target.y);
-          await waitForStability(page, 400);
+          await waitForStability(page, 200);
         }
         break;
       }
@@ -468,7 +648,7 @@ async function analyzeAndInteract(
         if (!selected) {
           console.log(`    DOM radio failed, falling back to coords (${action.target.x},${action.target.y})`);
           await clickAt(page, action.target.x, action.target.y);
-          await waitForStability(page, 300);
+          await waitForStability(page, 200);
         }
         break;
       }
@@ -476,9 +656,8 @@ async function analyzeAndInteract(
       case "scroll_modal": {
         const scrolled = await domScrollModal(page, "down");
         if (!scrolled) {
-          // Fallback to mouse wheel at coordinates
           await scrollInModal(page, action.target.x, action.target.y, 300);
-          await waitForStability(page, 400);
+          await waitForStability(page, 250);
         }
         break;
       }
@@ -486,41 +665,36 @@ async function analyzeAndInteract(
       case "scroll_down":
         if (!await domScrollModal(page, "down")) {
           await page.mouse.wheel(0, 300);
-          await waitForStability(page, 400);
+          await waitForStability(page, 250);
         }
         break;
 
       case "scroll_up":
         if (!await domScrollModal(page, "up")) {
           await page.mouse.wheel(0, -300);
-          await waitForStability(page, 400);
+          await waitForStability(page, 250);
         }
         break;
 
       case "type_text":
         if (action.text_to_type) {
-          // Find visible input and type into it
           try {
             const input = page.locator('input[type="text"]:visible, input:not([type]):visible, textarea:visible').first();
             await input.fill(action.text_to_type);
             console.log(`    DOM typed: "${action.text_to_type}"`);
-            await waitForStability(page, 200);
+            await waitForStability(page, 150);
           } catch {
             await clickAt(page, action.target.x, action.target.y);
             await waitForStability(page, 100);
             await typeText(page, action.text_to_type);
-            await waitForStability(page, 200);
+            await waitForStability(page, 150);
           }
         }
         break;
     }
   }
 
-  // After executing all vision-recommended actions, also try common patterns:
-  // If there's a modal with a Submit/Next/Continue button, click it
   await domClick(page, ["Submit", "Next", "Continue", "Confirm", "Proceed", "Done"]);
-
-  return analysis;
 }
 
 /**
@@ -626,7 +800,7 @@ async function domSubmitCode(
   }
 
   // Wait for dynamic submit buttons to appear after input is filled
-  await waitForStability(page, 500);
+  await waitForStability(page, 300);
 
   // --- Find and click submit via DOM ---
   const trySubmitSelectors = async (): Promise<boolean> => {
@@ -691,7 +865,7 @@ async function domSubmitCode(
   if (!submitFound) {
     console.log(`    Still no submit — scrolling down and retrying...`);
     await page.mouse.wheel(0, 200);
-    await waitForStability(page, 400);
+    await waitForStability(page, 250);
     submitFound = await trySubmitSelectors();
   }
 
@@ -722,7 +896,7 @@ async function domSubmitCode(
   }
 
   // Wait for page transition after submit
-  await waitForStability(page, 1500);
+  await waitForStability(page, 1000);
   return true;
 }
 
@@ -796,7 +970,7 @@ async function verifyStep(
   return { current_step: expectedStep, advanced: false, error_message: "", completed: false };
 }
 
-const MAX_INTERACTION_ROUNDS = 4;
+const MAX_INTERACTION_ROUNDS = 2;
 
 /**
  * DOM-only code check — no vision calls. Returns code or null.
@@ -813,12 +987,12 @@ async function domOnlyCodeCheck(page: Page): Promise<string | null> {
   return null;
 }
 
-const DOM_FIRST_TIMEOUT_MS = 15000;
+const DOM_FIRST_TIMEOUT_MS = 9000;
 
 /**
  * DOM-first solve: try every common interaction pattern via DOM selectors.
  * No vision calls. Returns code if found, null otherwise.
- * Hard timeout of 15 seconds — bail to vision if DOM can't solve it fast.
+ * Hard timeout of 9 seconds — bail to vision if DOM can't solve it fast.
  */
 async function domFirstSolve(page: Page): Promise<string | null> {
   console.log(`  DOM-first solve (${DOM_FIRST_TIMEOUT_MS / 1000}s timeout)...`);
@@ -828,97 +1002,48 @@ async function domFirstSolve(page: Page): Promise<string | null> {
 
   // 1. Scroll to top
   await page.evaluate(() => window.scrollTo(0, 0));
-  await waitForStability(page, 200);
+  await waitForStability(page, 150);
   if (expired()) { console.log(`  DOM-first: timeout`); return null; }
 
-  // 2. Click reveal/show buttons
+  // 2. Check DOM for code (already visible)
+  const initialCode = await domOnlyCodeCheck(page);
+  if (initialCode) return initialCode;
+
+  // 3. Click reveal/show buttons (including aria/data-action variants)
+  const revealSelectors = [
+    '[aria-label*="reveal" i]',
+    '[aria-label*="show" i]',
+    '[data-action*="reveal" i]',
+    '[data-testid*="reveal" i]',
+    '[data-testid*="show" i]',
+  ];
+  for (const sel of revealSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.isVisible({ timeout: 200 }).catch(() => false)) {
+      await loc.click({ timeout: 1000 });
+      await waitForStability(page, 250);
+      const code = await domOnlyCodeCheck(page);
+      if (code) return code;
+    }
+    if (expired()) { console.log(`  DOM-first: timeout`); return null; }
+  }
+
+  // 4. Click reveal/show buttons by text
   const revealClicked = await domClick(page, [
     "Reveal Code", "Reveal", "Show Code", "Show", "Get Code", "Generate Code",
     "View Code", "Display Code", "Unlock",
   ]);
   if (revealClicked) {
-    await waitForStability(page, 600);
-    const code = await domOnlyCodeCheck(page);
-    if (code) return code;
-  }
-  if (expired()) { console.log(`  DOM-first: timeout`); return null; }
-
-  // 3. Look for "click here" / "click N times" patterns and click them
-  try {
-    const clickHereEl = page.getByText(/click here/i).first();
-    if (await clickHereEl.isVisible({ timeout: 300 }).catch(() => false)) {
-      console.log(`    Clicking "click here" element`);
-      await clickHereEl.click();
-      await waitForStability(page, 300);
-      await clickHereEl.click().catch(() => {});
-      await waitForStability(page, 300);
-      await clickHereEl.click().catch(() => {});
-      await waitForStability(page, 400);
-      const code = await domOnlyCodeCheck(page);
-      if (code) return code;
-    }
-  } catch { /* not found */ }
-  if (expired()) { console.log(`  DOM-first: timeout`); return null; }
-
-  // Check for "click X times" pattern
-  try {
-    const clickTimesEl = page.getByText(/click.*times/i).first();
-    if (await clickTimesEl.isVisible({ timeout: 300 }).catch(() => false)) {
-      const text = await clickTimesEl.textContent().catch(() => "") || "";
-      const numMatch = text.match(/(\d+)\s*times/i);
-      const times = numMatch ? parseInt(numMatch[1], 10) : 3;
-      console.log(`    Found "click ${times} times" — clicking`);
-      for (let i = 0; i < Math.min(times, 10); i++) {
-        await clickTimesEl.click().catch(() => {});
-        await waitForStability(page, 150);
-        if (expired()) break;
-      }
-      await waitForStability(page, 400);
-      const code = await domOnlyCodeCheck(page);
-      if (code) return code;
-    }
-  } catch { /* not found */ }
-  if (expired()) { console.log(`  DOM-first: timeout`); return null; }
-
-  // 4. Handle modals with radio buttons: select "correct" one, click Submit
-  const radioSelected = await domSelectRadio(page, "correct");
-  if (radioSelected) {
     await waitForStability(page, 300);
-    const submitted = await domClick(page, [
-      "Submit", "Continue", "Next", "Confirm", "Done", "OK", "Proceed",
-    ]);
-    if (submitted) {
-      await waitForStability(page, 600);
-      const code = await domOnlyCodeCheck(page);
-      if (code) return code;
-    }
+    const code = await domOnlyCodeCheck(page);
+    if (code) return code;
   }
   if (expired()) { console.log(`  DOM-first: timeout`); return null; }
 
-  // 5. Scroll modal containers to bottom to reveal hidden content
-  const scrolled = await domScrollModal(page, "down");
-  if (scrolled) {
-    await waitForStability(page, 400);
+  // 5. Handle modals with radio buttons: scoped brute-force solve
+  if (await solveRadioModalBruteforce(page, deadline)) {
     const code = await domOnlyCodeCheck(page);
     if (code) return code;
-
-    if (!expired()) {
-      const radioAfterScroll = await domSelectRadio(page, "correct");
-      if (radioAfterScroll) {
-        await waitForStability(page, 300);
-        await domClick(page, ["Submit", "Continue", "Next", "Confirm", "Done"]);
-        await waitForStability(page, 600);
-        const code2 = await domOnlyCodeCheck(page);
-        if (code2) return code2;
-      }
-    }
-
-    if (!expired()) {
-      await domScrollModal(page, "down");
-      await waitForStability(page, 400);
-      const code3 = await domOnlyCodeCheck(page);
-      if (code3) return code3;
-    }
   }
   if (expired()) { console.log(`  DOM-first: timeout`); return null; }
 
@@ -927,7 +1052,7 @@ async function domFirstSolve(page: Page): Promise<string | null> {
     "Submit", "Continue", "Next", "Proceed", "Confirm", "Done", "OK", "Go",
   ]);
   if (anySubmit) {
-    await waitForStability(page, 600);
+    await waitForStability(page, 300);
     const code = await domOnlyCodeCheck(page);
     if (code) return code;
   }
@@ -947,9 +1072,9 @@ async function domFirstSolve(page: Page): Promise<string | null> {
       } catch { /* skip */ }
       if (expired()) break;
     }
-    await waitForStability(page, 300);
+    await waitForStability(page, 200);
     await domClick(page, ["Submit", "Continue", "Next", "Confirm"]);
-    await waitForStability(page, 600);
+    await waitForStability(page, 300);
     const code = await domOnlyCodeCheck(page);
     if (code) return code;
   }
@@ -972,12 +1097,48 @@ async function domFirstSolve(page: Page): Promise<string | null> {
       } catch { /* skip */ }
       if (expired()) break;
     }
-    await waitForStability(page, 300);
+    await waitForStability(page, 200);
     await domClick(page, ["Submit", "Continue", "Next", "Confirm"]);
-    await waitForStability(page, 600);
+    await waitForStability(page, 300);
     const code = await domOnlyCodeCheck(page);
     if (code) return code;
   }
+
+  // 9. "Click here" / "click N times" patterns (cap to ~2s total)
+  const clickHereDeadline = Date.now() + 2000;
+  try {
+    const clickTimesEl = page.getByText(/click.*times/i).first();
+    if (await clickTimesEl.isVisible({ timeout: 200 }).catch(() => false)) {
+      const text = await clickTimesEl.textContent().catch(() => "") || "";
+      const numMatch = text.match(/(\\d+)\\s*times/i);
+      const times = numMatch ? parseInt(numMatch[1], 10) : 2;
+      console.log(`    Found "click ${times} times" — clicking`);
+      for (let i = 0; i < Math.min(times, 6); i++) {
+        await clickTimesEl.click().catch(() => {});
+        await waitForStability(page, 120);
+        if (Date.now() >= clickHereDeadline) break;
+      }
+      await waitForStability(page, 200);
+      const code = await domOnlyCodeCheck(page);
+      if (code) return code;
+    }
+  } catch { /* not found */ }
+
+  try {
+    const clickHereEl = page.getByText(/click here/i).first();
+    if (await clickHereEl.isVisible({ timeout: 200 }).catch(() => false)) {
+      console.log(`    Clicking "click here" element (capped)`);
+      await clickHereEl.click().catch(() => {});
+      await waitForStability(page, 150);
+      const code = await domOnlyCodeCheck(page);
+      if (code) return code;
+    }
+  } catch { /* not found */ }
+
+  // 10. Action-space explorer (bounded, LLM-free)
+  const exploreDeadline = Math.min(deadline, Date.now() + 3000);
+  const exploreCode = await actionSpaceExplorer(page, exploreDeadline);
+  if (exploreCode) return exploreCode;
 
   console.log(`  DOM-first solve: no code found`);
   return null;
@@ -1012,41 +1173,47 @@ export async function runStep(
     // Phase 4: Vision fallback — only if DOM couldn't solve it
     if (!code) {
       console.log(`  DOM-first failed — falling back to vision`);
-      code = await tryExtractCode(page, config, `step${stepNumber}-a${attempt}-vision`);
-    }
-
-    if (!code) {
       for (let round = 0; round < MAX_INTERACTION_ROUNDS; round++) {
-        // Analyze page and execute recommended interactions
-        const analysis = await analyzeAndInteract(page, config, stepNumber, round);
+        const img = await screenshot(page, `step${stepNumber}-a${attempt}-r${round}`);
+        const [combinedResult, analysisResult] = await callGeminiParallel<[CombinedResult, PageAnalysis]>(
+          config.apiKey,
+          [
+            { prompt: COMBINED_PROMPT, schema: combinedSchema, thinkingBudget: 0 },
+            { prompt: ANALYZE_PAGE_PROMPT, schema: analyzePageSchema, thinkingBudget: 0 },
+          ],
+          img
+        );
 
-        // If vision found a code during analysis, use it
+        const combined = combinedResult.parsed;
+        const analysis = analysisResult.parsed;
+
+        if (combined.code !== "NONE" && combined.code.length === 6) {
+          code = combined.code;
+          console.log(`  Code found via combined vision: ${code}`);
+          break;
+        }
+
         if (analysis.has_code_visible && analysis.code !== "NONE" && analysis.code.length === 6) {
           code = analysis.code;
           console.log(`  Code found via analysis: ${code}`);
           break;
         }
 
-        // Check DOM again after interactions
-        code = await tryExtractCode(page, config, `step${stepNumber}-a${attempt}-post-interact-r${round}`);
+        await executeAnalysisActions(page, analysis);
+        code = await domOnlyCodeCheck(page);
         if (code) {
           console.log(`  Code found after interaction round ${round}: ${code}`);
           break;
         }
 
-        // If no actions were recommended, we're stuck
         if (analysis.recommended_actions.length === 0) {
           console.log(`  No more actions to try, scrolling page...`);
           await page.mouse.wheel(0, 300);
-          await waitForStability(page, 500);
-
-          // One more DOM check after scroll
-          code = await tryExtractCode(page, config, `step${stepNumber}-a${attempt}-scrolled-r${round}`);
-          if (code) break;
-
-          // Scroll back up
-          await page.evaluate(() => window.scrollTo(0, 0));
           await waitForStability(page, 300);
+          code = await domOnlyCodeCheck(page);
+          if (code) break;
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await waitForStability(page, 200);
           break;
         }
       }
@@ -1065,7 +1232,7 @@ export async function runStep(
     }
 
     // Phase 6: Verify (DOM-based)
-    await waitForStability(page, 500);
+    await waitForStability(page, 300);
     const verification = await verifyStep(page, stepNumber);
 
     if (verification.completed) {
