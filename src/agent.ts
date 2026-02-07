@@ -490,9 +490,13 @@ async function executeAction(page: Page, action: AgentAction): Promise<ExecResul
     if (action.type === "dismiss_overlays") {
       await dismissOverlays(page, now() + DISMISS_TIME_CAP_MS);
     } else if (action.type === "click_eid") {
-      await page
-        .locator(`[data-agent-eid="${action.eid}"]`)
-        .click({ timeout: 800 });
+      try {
+        await page
+          .locator(`[data-agent-eid="${action.eid}"]`)
+          .click({ timeout: 800 });
+      } catch {
+        return { success: false, codeFound: null, trapDetected: false, dialogDismissed: false };
+      }
     } else if (action.type === "type_eid") {
       await page
         .locator(`[data-agent-eid="${action.eid}"]`)
@@ -614,7 +618,17 @@ async function submitCodeWithSnapshot(
 
   const submitEid = await selectSubmitButton(page, snap);
   if (submitEid) {
-    await page.locator(`[data-agent-eid="${submitEid}"]`).click({ timeout: 800 });
+    const submitLoc = page.locator(`[data-agent-eid="${submitEid}"]`);
+    try {
+      await submitLoc.click({ timeout: 800 });
+    } catch {
+      await dismissOverlays(page, now() + DISMISS_TIME_CAP_MS);
+      try {
+        await submitLoc.click({ timeout: 800 });
+      } catch {
+        await page.keyboard.press("Enter");
+      }
+    }
   } else {
     await page.keyboard.press("Enter");
   }
@@ -999,6 +1013,7 @@ async function solveStep(
   const domCode = await checkForCode(page);
   if (domCode) {
     const snap = await captureDOMSnapshot(page);
+    await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
     await submitCodeWithSnapshot(page, snap, domCode);
     const verify = await verifyStep(page, stepNumber);
     if (verify.advanced || verify.completed) return { success: true };
@@ -1010,6 +1025,7 @@ async function solveStep(
     if (!withinDeadline(deadline)) break;
     const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt);
     if (result.code) {
+      await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
       await submitCodeWithSnapshot(page, snap, result.code);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
@@ -1025,10 +1041,12 @@ async function solveStep(
     for (const action of scoutActions) {
       if (!withinDeadline(deadline)) break;
       if (action.type === "submit_code") {
+        await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
         await submitCodeWithSnapshot(page, snap, action.code);
       } else {
         const exec = await executeAction(page, action);
         if (exec.codeFound) {
+          await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
           await submitCodeWithSnapshot(page, snap, exec.codeFound);
         }
         if (exec.trapDetected) break;
@@ -1049,10 +1067,15 @@ async function solveStep(
     );
 
     if (parsed.code && parsed.code !== "NONE") {
-      const latestSnap = await captureDOMSnapshot(page);
-      await submitCodeWithSnapshot(page, latestSnap, parsed.code);
-      const verify = await verifyStep(page, stepNumber);
-      if (verify.advanced || verify.completed) return { success: true };
+      try {
+        const latestSnap = await captureDOMSnapshot(page);
+        await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
+        await submitCodeWithSnapshot(page, latestSnap, parsed.code);
+        const verify = await verifyStep(page, stepNumber);
+        if (verify.advanced || verify.completed) return { success: true };
+      } catch {
+        console.log(`  [WARN] Vision fallback submit failed for step ${stepNumber}`);
+      }
     }
   }
 
