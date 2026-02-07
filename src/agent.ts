@@ -210,6 +210,72 @@ function clampText(text: string, maxLength: number): string {
   return text.slice(0, maxLength);
 }
 
+// Extract codes ONLY from visible text (innerText), not attributes/hidden DOM.
+// This prevents phantom codes like BJK5AQ that come from data-* attributes or hidden nodes.
+const EXTRACT_VISIBLE_CODES_SCRIPT = `(function() {
+  var text = (document.body ? document.body.innerText : "") || "";
+  var re = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/g;
+  var out = [];
+  var seen = {};
+  var m;
+  while ((m = re.exec(text)) && out.length < 25) {
+    var c = m[0];
+    if (!seen[c]) { seen[c] = true; out.push(c); }
+  }
+  return out;
+})()`;
+
+async function extractVisibleCodes(page: Page): Promise<string[]> {
+  return (await page.evaluate(EXTRACT_VISIBLE_CODES_SCRIPT)) as string[];
+}
+
+// Log the DOM source of a phantom code once (debugging where it comes from)
+const loggedDomOnlyCodes = new Set<string>();
+
+async function logDomOnlyCodeSourceOnce(page: Page, code: string): Promise<void> {
+  if (loggedDomOnlyCodes.has(code)) return;
+  loggedDomOnlyCodes.add(code);
+
+  const hits = await page
+    .evaluate(`(function() {
+      var code = ${JSON.stringify(code)};
+      var out = [];
+      var all = Array.from(document.querySelectorAll("*"));
+
+      function isVisible(el) {
+        var s = window.getComputedStyle(el);
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+      }
+
+      for (var i = 0; i < all.length && out.length < 8; i++) {
+        var el = all[i];
+        var tag = (el.tagName || "").toLowerCase();
+        var eid = el.getAttribute("data-agent-eid") || "";
+
+        var text = (el.textContent || "");
+        if (text && text.indexOf(code) !== -1) {
+          out.push({ kind: "text", tag: tag, eid: eid, visible: isVisible(el), snippet: text.trim().slice(0, 180) });
+          continue;
+        }
+
+        if (el.attributes) {
+          for (var j = 0; j < el.attributes.length; j++) {
+            var a = el.attributes[j];
+            if (a && a.value && String(a.value).indexOf(code) !== -1) {
+              out.push({ kind: "attr", tag: tag, eid: eid, visible: isVisible(el), attr: a.name, value: String(a.value).slice(0, 180) });
+              break;
+            }
+          }
+        }
+      }
+      return out;
+    })()`)
+    .catch(() => null);
+
+  console.log(`[DOM_CODE_SOURCE] ${code} ${JSON.stringify(hits)}`);
+}
+
 function pickCode(codes: Array<{ code: string; score: number }>, exclude?: Set<string>): string | null {
   const normalized = codes
     .map((c) => c.code.trim())
@@ -220,8 +286,24 @@ function pickCode(codes: Array<{ code: string; score: number }>, exclude?: Set<s
 }
 
 async function checkForCode(page: Page, exclude?: Set<string>): Promise<string | null> {
-  const codes = await extractCodesFromDOM(page);
-  return pickCode(codes, exclude);
+  // Only accept codes that appear in visible text (innerText).
+  const visible = await extractVisibleCodes(page).catch(() => []);
+  const candidate =
+    visible
+      .map((c) => c.trim())
+      .find((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code) && (!exclude || !exclude.has(code))) ?? null;
+
+  if (candidate) return candidate;
+
+  // Debug: if extractCodesFromDOM is finding something that innerText doesn't contain,
+  // log where it's coming from once (this is how you catch phantom data-attribute codes).
+  const domCodes = await extractCodesFromDOM(page).catch(() => []);
+  const domCandidate = pickCode(domCodes, exclude);
+  if (domCandidate) {
+    await logDomOnlyCodeSourceOnce(page, domCandidate);
+  }
+
+  return null;
 }
 
 async function detectTrap(page: Page): Promise<boolean> {
@@ -305,9 +387,14 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
   function isVisible(el) {
     var style = window.getComputedStyle(el);
     var rect = el.getBoundingClientRect();
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+    var inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < vh && rect.left < vw;
+
     return (
       rect.width > 0 &&
       rect.height > 0 &&
+      inViewport &&
       style.display !== "none" &&
       style.visibility !== "hidden" &&
       style.opacity !== "0"
@@ -461,9 +548,8 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
 })()`;
 
 async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
-  const codesFound = await extractCodesFromDOM(page);
-  const codeList = codesFound
-    .map((c) => c.code.trim())
+  const codeList = (await extractVisibleCodes(page))
+    .map((c) => c.trim())
     .filter((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code));
 
   const snapshot = await page.evaluate(CAPTURE_DOM_SNAPSHOT_SCRIPT) as any;
@@ -661,9 +747,22 @@ async function selectSubmitButton(
       }
     }
 
+    function isTopmost(el) {
+      var r = el.getBoundingClientRect();
+      var cx = r.x + r.width / 2;
+      var cy = r.y + r.height / 2;
+      if (!isFinite(cx) || !isFinite(cy)) return false;
+      var top = document.elementFromPoint(cx, cy);
+      return top === el || (top && el.contains(top));
+    }
+
     // Gather all visible buttons with EIDs
     var allBtns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]'));
-    var visible = allBtns.filter(function(b) { return isVis(b) && b.getAttribute("data-agent-eid"); });
+    var visibleAll = allBtns.filter(function(b) { return isVis(b) && b.getAttribute("data-agent-eid"); });
+    var visibleTop = visibleAll.filter(function(b) { return isTopmost(b); });
+
+    // Prefer truly clickable (topmost) buttons if we have any
+    var visible = visibleTop.length > 0 ? visibleTop : visibleAll;
 
     var kw = /submit|confirm|continue|next|send|ok|go/i;
     var prioritized = visible.filter(function(b) {
@@ -728,13 +827,35 @@ async function submitCodeWithSnapshot(
         await submitLoc.click({ timeout: 800 });
         console.log(`  [SUBMIT] retry click succeeded`);
       } catch {
-        console.log(`  [SUBMIT] retry failed, pressing Enter fallback`);
-        await page.keyboard.press("Enter");
+        console.log(`  [SUBMIT] retry failed, attempting JS click`);
+
+        const jsClicked = await page
+          .evaluate(`(function(eid) {
+            var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+            if (!el) return false;
+            try { el.click(); return true; } catch (e) { return false; }
+          })("${submitEid}")`)
+          .catch(() => false);
+
+        if (jsClicked) {
+          console.log(`  [SUBMIT] JS click dispatched`);
+        } else {
+          console.log(`  [SUBMIT] JS click failed, pressing Enter fallback`);
+          if (inputEid) {
+            await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
+          } else {
+            await page.keyboard.press("Enter").catch(() => undefined);
+          }
+        }
       }
     }
   } else {
     console.log(`  [SUBMIT] no submit button, pressing Enter`);
-    await page.keyboard.press("Enter");
+    if (inputEid) {
+      await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
+    } else {
+      await page.keyboard.press("Enter").catch(() => undefined);
+    }
   }
 
   await waitForStability(page, 300);
@@ -1106,6 +1227,9 @@ async function buildScoutActions(
     img
   );
 
+  // DEBUG: log the full Gemini outputs (before we filter hallucinated EIDs / cap repeats)
+  console.log(`[SCOUT_RAW_RESULTS] ${JSON.stringify(results)}`);
+
   const candidates = results
     .map((r) => r.parsed)
     .filter((p): p is ScoutResult => Boolean(p && Array.isArray(p.actions)));
@@ -1123,7 +1247,27 @@ async function buildScoutActions(
   ]);
 
   const filtered: AgentAction[] = [];
-  const seen = new Set<string>();
+
+  // Allow repeats (e.g. many PageDown presses), but cap obvious loops.
+  const repeatCounts = new Map<string, number>();
+
+  const repeatKey = (action: AgentAction): string => {
+    if (action.type === "press_key") return `${action.type}-${action.key}`;
+    if (action.type === "submit_code") return `${action.type}-${action.code}`;
+    // @ts-ignore
+    if (action.eid) return `${action.type}-${action.eid}`;
+    return action.type;
+  };
+
+  const repeatCap = (action: AgentAction): number => {
+    if (action.type === "submit_code") return 1;
+    if (action.type === "dismiss_overlays") return 3;
+    if (action.type === "press_key") return 15;           // keep many PageDowns
+    if (action.type === "click_eid") return 8;            // allow brute-force clicking
+    if (action.type === "scroll_eid_to_bottom") return 8;
+    if (action.type === "check_eid") return 6;
+    return 3; // type_eid / select_eid_by_index
+  };
 
   for (const action of rawActions) {
     const needsEid =
@@ -1153,14 +1297,15 @@ async function buildScoutActions(
       if (typeof action.code !== "string") continue;
     }
 
-    const key = `${action.type}-${(action as any).eid ?? ""}-${(action as any).code ?? ""}-${(action as any).key ?? ""}-${(action as any).index ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const k = repeatKey(action);
+    const n = (repeatCounts.get(k) ?? 0) + 1;
+    if (n > repeatCap(action)) continue;
+    repeatCounts.set(k, n);
 
     filtered.push(action);
   }
 
-  console.log(`[SCOUT_LOG] ${JSON.stringify({ confidence: best?.confidence ?? 0, actionCount: filtered.length })}`);
+  console.log(`[SCOUT_LOG] ${JSON.stringify({ confidence: best?.confidence ?? 0, rawCount: rawActions.length, actionCount: filtered.length })}`);
   return filtered.slice(0, MAX_SCOUT_ACTIONS);
 }
 
