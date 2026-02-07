@@ -22,20 +22,39 @@ import {
   extractCodesFromDOM,
 } from "./browser.js";
 
-const STEP_DEADLINE_MS = 9000;
+const STEP_DEADLINE_MS = 15000;
 const MAX_STEP_ATTEMPTS = 2;
 const DISMISS_TIME_CAP_MS = 2500;
 const MAX_DISMISS_ROUNDS = 3;
 const MAX_SCOUT_BATCHES = 1;
-const MAX_SCOUT_ACTIONS = 12;
+const MAX_SCOUT_ACTIONS = 25;
 const SCROLL_SWEEPS = 5;
 const RADIO_BRUTEFORCE_LIMIT = 8;
-const RUN_DEADLINE_MS = 5 * 60 * 1000;
+const RUN_DEADLINE_MS = 10 * 60 * 1000;
 
-const MODAL_SCOUT_PROMPT = `You are a browser automation scout. You receive a DOM snapshot with data-agent-eid values and a screenshot.
-Focus on dialogs/modals, radios, scrolling, and submit buttons. If you can see the 6-character code, return a submit_code action.
+const PRIMARY_SCOUT_PROMPT = `You are the PRIMARY solver for a browser-navigation challenge step.
+
+Important:
+- A 6-character code may NOT exist yet. Many steps require scrolling/clicking to reveal the code.
+- There is no penalty for wrong clicks; controlled brute-force is allowed.
+- Avoid obvious traps/popups like "You have won a prize!" unless your goal is to close them.
+
+You receive:
+- A screenshot
+- A DOM snapshot with data-agent-eid on elements
+- clickables include: eid, text/ariaLabel, visible, bbox=[x,y,w,h] in screenshot coordinates (viewport)
+
+Goal:
+- Reveal a valid code, then output a submit_code action; OR
+- Navigate/modify the page state so the code becomes visible.
+
+Valid code format:
+- Exactly 6 alphanumeric characters and MUST contain at least 1 digit.
+- Example: A1B2C3
+- Invalid: REVEAL (no digit)
 
 Return JSON with: { actions: AgentAction[], confidence: number }
+
 AgentAction schema:
 - { type: "dismiss_overlays" }
 - { type: "click_eid", eid: string }
@@ -43,42 +62,15 @@ AgentAction schema:
 - { type: "check_eid", eid: string }
 - { type: "select_eid_by_index", eid: string, index: number }
 - { type: "scroll_eid_to_bottom", eid: string }
-- { type: "press_key", key: "Enter" | "Escape" | "Tab" }
+- { type: "press_key", key: "Enter" | "Escape" | "Tab" | "PageDown" | "End" }
 - { type: "submit_code", code: string }
 
-Use ONLY EIDs from the snapshot. Keep actions minimal.`;
-
-const REVEAL_SCOUT_PROMPT = `You are a browser automation scout. You receive a DOM snapshot with data-agent-eid values and a screenshot.
-Focus on reveal/show/unlock/display controls, hidden panels, or unusual UI patterns. If you can see the 6-character code, return a submit_code action.
-
-Return JSON with: { actions: AgentAction[], confidence: number }
-AgentAction schema:
-- { type: "dismiss_overlays" }
-- { type: "click_eid", eid: string }
-- { type: "type_eid", eid: string, text: string }
-- { type: "check_eid", eid: string }
-- { type: "select_eid_by_index", eid: string, index: number }
-- { type: "scroll_eid_to_bottom", eid: string }
-- { type: "press_key", key: "Enter" | "Escape" | "Tab" }
-- { type: "submit_code", code: string }
-
-Use ONLY EIDs from the snapshot. Keep actions minimal.`;
-
-const FORM_SCOUT_PROMPT = `You are a browser automation scout. You receive a DOM snapshot with data-agent-eid values and a screenshot.
-Focus on inputs, selects, checkboxes, and form submission. If you can see the 6-character code, return a submit_code action.
-
-Return JSON with: { actions: AgentAction[], confidence: number }
-AgentAction schema:
-- { type: "dismiss_overlays" }
-- { type: "click_eid", eid: string }
-- { type: "type_eid", eid: string, text: string }
-- { type: "check_eid", eid: string }
-- { type: "select_eid_by_index", eid: string, index: number }
-- { type: "scroll_eid_to_bottom", eid: string }
-- { type: "press_key", key: "Enter" | "Escape" | "Tab" }
-- { type: "submit_code", code: string }
-
-Use ONLY EIDs from the snapshot. Keep actions minimal.`;
+Rules:
+- Use ONLY EIDs from the snapshot.
+- Prefer actions that match the screenshot: choose the clickable whose bbox matches the button you intend to press.
+- If the UI says to scroll, use press_key PageDown/End and/or scroll_eid_to_bottom on a page-level scrollable.
+- You may output up to 25 actions.
+- Keep the plan coherent and ordered (sequence matters).`;
 
 interface DOMSnapshot {
   url: string;
@@ -102,6 +94,8 @@ interface DOMSnapshot {
     text: string;
     ariaLabel: string;
     inDialog: string | null;
+    visible: boolean;
+    bbox: [number, number, number, number]; // [x,y,w,h] in viewport coords
   }>;
   scrollables: Array<{ eid: string; inDialog: string | null }>;
   features: {
@@ -125,7 +119,7 @@ type AgentAction =
   | { type: "check_eid"; eid: string }
   | { type: "select_eid_by_index"; eid: string; index: number }
   | { type: "scroll_eid_to_bottom"; eid: string }
-  | { type: "press_key"; key: "Enter" | "Escape" | "Tab" }
+  | { type: "press_key"; key: "Enter" | "Escape" | "Tab" | "PageDown" | "End" }
   | { type: "submit_code"; code: string };
 
 interface ExecResult {
@@ -403,12 +397,22 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
         }
         parent = parent.parentElement;
       }
+
+      var rect = el.getBoundingClientRect();
+
       return {
         eid: el.getAttribute("data-agent-eid") || "",
         tag: el.tagName.toLowerCase(),
         text: truncate(textOf(el), 80),
         ariaLabel: truncate(el.getAttribute("aria-label") || "", 80),
-        inDialog: inDialog
+        inDialog: inDialog,
+        visible: isVisible(el),
+        bbox: [
+          Math.round(rect.x),
+          Math.round(rect.y),
+          Math.round(rect.width),
+          Math.round(rect.height)
+        ]
       };
     });
 
@@ -429,7 +433,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
     });
 
   var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 800);
-  var hasCodeVisible = /(?=.*[0-9])[A-Za-z0-9]{6}/.test(bodyText);
+  var hasCodeVisible = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/.test(bodyText);
   var hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
   var hasClickHereText = /(click here|click\\s+\\d+\\s+times)/i.test(bodyText);
 
@@ -458,7 +462,9 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
 
 async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
   const codesFound = await extractCodesFromDOM(page);
-  const codeList = codesFound.map((c) => c.code).filter((code) => code.length > 0);
+  const codeList = codesFound
+    .map((c) => c.code.trim())
+    .filter((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code));
 
   const snapshot = await page.evaluate(CAPTURE_DOM_SNAPSHOT_SCRIPT) as any;
 
@@ -543,19 +549,35 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
   // Nuclear overlay removal: forcefully remove blocking overlays from DOM
   await page.evaluate(`(function() {
     var all = document.querySelectorAll("*");
+    var vw = window.innerWidth || 1;
+    var vh = window.innerHeight || 1;
+    var vArea = vw * vh;
+
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       var style = window.getComputedStyle(el);
       var pos = style.position;
       if (pos !== "fixed" && pos !== "absolute") continue;
+
       var z = parseInt(style.zIndex, 10);
-      if (isNaN(z) || z <= 999) continue;
+      if (isNaN(z) || z <= 99) continue;
+
+      // don't remove real interactive containers
       if (el.querySelector("input, textarea, select")) continue;
+
       var text = (el.innerText || "").toLowerCase();
       if (/step\\s+\\d/.test(text)) continue;
-      var dominated = parseFloat(style.opacity) < 1
-        || /prize|won|congratulations|winner|reward/i.test(text);
-      var isBackdrop = el.children.length === 0 && text.trim().length === 0;
+
+      var rect = el.getBoundingClientRect();
+      var area = Math.max(0, rect.width) * Math.max(0, rect.height);
+      var big = area > vArea * 0.2;
+
+      var hasKeyword = /prize|won|congratulations|winner|reward|alert/i.test(text);
+      var semiTransparent = (parseFloat(style.opacity) < 1);
+
+      var dominated = hasKeyword || (semiTransparent && big);
+      var isBackdrop = big && el.children.length === 0 && text.trim().length === 0;
+
       if (dominated || isBackdrop) {
         el.remove();
       }
@@ -563,6 +585,7 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
   })()`).catch(() => undefined);
 
   const dismissSelectors = [
+    // aria / common classes
     '[aria-label*="close" i]',
     '[aria-label*="dismiss" i]',
     '[aria-label*="exit" i]',
@@ -574,6 +597,15 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
     '.btn-close',
     '[data-dismiss]',
     '[data-bs-dismiss]',
+
+    // explicit button text (prize/alert popups often use these)
+    'button:has-text("Close")',
+    'button:has-text("OK")',
+    'button:has-text("Ok")',
+    'button:has-text("Got it")',
+    'button:has-text("No thanks")',
+    'button:has-text("×")',
+    'button:has-text("X")',
   ];
 
   for (let round = 0; round < MAX_DISMISS_ROUNDS && withinDeadline(deadline); round += 1) {
@@ -1060,10 +1092,12 @@ async function buildScoutActions(
 ): Promise<AgentAction[]> {
   const snapshotJson = compactSnapshot(snap);
   const img = await screenshot(page, "scout");
+
+  // Run 3 identical primary scouts for redundancy, then pick highest-confidence plan.
   const calls = [
-    { prompt: `${MODAL_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
-    { prompt: `${REVEAL_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
-    { prompt: `${FORM_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
+    { prompt: `${PRIMARY_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
+    { prompt: `${PRIMARY_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
+    { prompt: `${PRIMARY_SCOUT_PROMPT}\n\nSNAPSHOT:\n${snapshotJson}`, schema: scoutSchema, thinkingBudget: 128 },
   ];
 
   const results = await callGeminiParallel<[ScoutResult, ScoutResult, ScoutResult]>(
@@ -1072,30 +1106,62 @@ async function buildScoutActions(
     img
   );
 
-  const actions = results.flatMap((r) => r.parsed.actions || []);
-  const activeDialog = snap.activeDialogEid;
+  const candidates = results
+    .map((r) => r.parsed)
+    .filter((p): p is ScoutResult => Boolean(p && Array.isArray(p.actions)));
 
-  const unique = new Map<string, AgentAction>();
-  for (const action of actions) {
-    const key = `${action.type}-${"eid" in action ? action.eid : ""}-${"code" in action ? action.code : ""}`;
-    if (!unique.has(key)) unique.set(key, action);
+  const best = candidates.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))[0];
+
+  const rawActions = best?.actions ?? [];
+
+  // Filter hallucinated EIDs but preserve order (sequence matters)
+  const knownEids = new Set<string>([
+    ...snap.clickables.map((c) => c.eid),
+    ...snap.inputs.map((i) => i.eid),
+    ...snap.scrollables.map((s) => s.eid),
+    ...snap.dialogs.map((d) => d.eid),
+  ]);
+
+  const filtered: AgentAction[] = [];
+  const seen = new Set<string>();
+
+  for (const action of rawActions) {
+    const needsEid =
+      action.type === "click_eid" ||
+      action.type === "type_eid" ||
+      action.type === "check_eid" ||
+      action.type === "select_eid_by_index" ||
+      action.type === "scroll_eid_to_bottom";
+
+    if (needsEid) {
+      // @ts-ignore - narrowed by action.type at runtime
+      if (!action.eid || !knownEids.has(action.eid)) continue;
+    }
+
+    if (action.type === "type_eid") {
+      // @ts-ignore
+      if (typeof action.text !== "string") continue;
+    }
+
+    if (action.type === "select_eid_by_index") {
+      // @ts-ignore
+      if (typeof action.index !== "number") continue;
+    }
+
+    if (action.type === "submit_code") {
+      // @ts-ignore
+      if (typeof action.code !== "string") continue;
+    }
+
+    const key = `${action.type}-${(action as any).eid ?? ""}-${(action as any).code ?? ""}-${(action as any).key ?? ""}-${(action as any).index ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    filtered.push(action);
   }
 
-  const prioritized = Array.from(unique.values()).sort((a, b) => {
-    const inDialog = (action: AgentAction) => {
-      if (!activeDialog) return false;
-      if (action.type === "click_eid" || action.type === "type_eid" || action.type === "check_eid" || action.type === "select_eid_by_index" || action.type === "scroll_eid_to_bottom") {
-        return snap.clickables.some((c) => c.eid === action.eid && c.inDialog === activeDialog)
-          || snap.scrollables.some((s) => s.eid === action.eid && s.inDialog === activeDialog)
-          || snap.inputs.some((i) => i.eid === action.eid);
-      }
-      return false;
-    };
-    return Number(inDialog(b)) - Number(inDialog(a));
-  });
-
-  console.log(`[SCOUT_LOG] ${JSON.stringify({ actionCount: prioritized.length })}`);
-  return prioritized.slice(0, MAX_SCOUT_ACTIONS);
+  console.log(`[SCOUT_LOG] ${JSON.stringify({ confidence: best?.confidence ?? 0, actionCount: filtered.length })}`);
+  return filtered.slice(0, MAX_SCOUT_ACTIONS);
 }
 
 async function solveStep(
@@ -1108,9 +1174,12 @@ async function solveStep(
   const deadline = now() + STEP_DEADLINE_MS;
   const triedCodes = new Set<string>();
 
+  const isValidCode = (code: string) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code.trim());
+
   await injectEIDs(page);
   await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
 
+  // Phase 0: immediate code check (fast path)
   const domCode = await checkForCode(page, triedCodes);
   if (domCode) {
     await submitCodeSafe(page, domCode, deadline);
@@ -1120,8 +1189,71 @@ async function solveStep(
     console.log(`  [STALE] code ${domCode} failed, added to triedCodes`);
   }
 
-  let snap = await captureDOMSnapshot(page);
+  // Phase 1: SCOUTS FIRST (navigation/reveal/progress)
+  if (withinDeadline(deadline) && MAX_SCOUT_BATCHES > 0) {
+    for (let batch = 0; batch < MAX_SCOUT_BATCHES && withinDeadline(deadline); batch += 1) {
+      await injectEIDs(page);
+      const scoutSnap = await captureDOMSnapshot(page);
+      const scoutActions = await buildScoutActions(page, config, scoutSnap);
 
+      for (const action of scoutActions) {
+        if (!withinDeadline(deadline)) break;
+
+        if (action.type === "submit_code") {
+          const candidate = action.code.trim();
+
+          // IMPORTANT: filter scout-provided codes (prevents "REVEAL" etc)
+          if (!isValidCode(candidate)) {
+            console.log(`  [SCOUT] Ignoring invalid code "${action.code}"`);
+            continue;
+          }
+          if (triedCodes.has(candidate)) continue;
+
+          await submitCodeSafe(page, candidate, deadline);
+          const verify = await verifyStep(page, stepNumber);
+          if (verify.advanced || verify.completed) return { success: true };
+
+          triedCodes.add(candidate);
+          console.log(`  [STALE] code ${candidate} failed, added to triedCodes`);
+          continue;
+        }
+
+        const exec = await executeAction(page, action);
+
+        // prize/alert traps spawn constantly; clean quickly
+        await dismissOverlays(page, Math.min(deadline, now() + 600));
+
+        // sometimes navigation advances without code appearing yet
+        const verifyAfterAction = await verifyStep(page, stepNumber);
+        if (verifyAfterAction.advanced || verifyAfterAction.completed) return { success: true };
+
+        if (exec.codeFound && !triedCodes.has(exec.codeFound)) {
+          await submitCodeSafe(page, exec.codeFound, deadline);
+          const verify = await verifyStep(page, stepNumber);
+          if (verify.advanced || verify.completed) return { success: true };
+
+          triedCodes.add(exec.codeFound);
+          console.log(`  [STALE] code ${exec.codeFound} failed, added to triedCodes`);
+        }
+
+        if (exec.trapDetected) break;
+      }
+
+      // post-batch check in case code appeared but was missed
+      const codeAfter = await checkForCode(page, triedCodes);
+      if (codeAfter && withinDeadline(deadline)) {
+        await submitCodeSafe(page, codeAfter, deadline);
+        const verify = await verifyStep(page, stepNumber);
+        if (verify.advanced || verify.completed) return { success: true };
+
+        triedCodes.add(codeAfter);
+        console.log(`  [STALE] code ${codeAfter} failed, added to triedCodes`);
+      }
+    }
+  }
+
+  // Phase 2: skills as accelerators (known patterns) AFTER scouts
+  let snap = await captureDOMSnapshot(page);
   for (const skill of skills) {
     if (!withinDeadline(deadline)) break;
     const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt, triedCodes);
@@ -1129,6 +1261,7 @@ async function solveStep(
       await submitCodeSafe(page, result.code, deadline);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
+
       triedCodes.add(result.code);
       console.log(`  [STALE] code ${result.code} failed, added to triedCodes`);
       snap = await captureDOMSnapshot(page);
@@ -1138,33 +1271,7 @@ async function solveStep(
     snap = await captureDOMSnapshot(page);
   }
 
-  if (withinDeadline(deadline) && MAX_SCOUT_BATCHES > 0) {
-    await injectEIDs(page);
-    snap = await captureDOMSnapshot(page);
-    const scoutActions = await buildScoutActions(page, config, snap);
-    for (const action of scoutActions) {
-      if (!withinDeadline(deadline)) break;
-      if (action.type === "submit_code") {
-        if (triedCodes.has(action.code)) continue;
-        await submitCodeSafe(page, action.code, deadline);
-        const verify = await verifyStep(page, stepNumber);
-        if (verify.advanced || verify.completed) return { success: true };
-        triedCodes.add(action.code);
-        console.log(`  [STALE] code ${action.code} failed, added to triedCodes`);
-      } else {
-        const exec = await executeAction(page, action);
-        if (exec.codeFound && !triedCodes.has(exec.codeFound)) {
-          await submitCodeSafe(page, exec.codeFound, deadline);
-          const verify = await verifyStep(page, stepNumber);
-          if (verify.advanced || verify.completed) return { success: true };
-          triedCodes.add(exec.codeFound);
-          console.log(`  [STALE] code ${exec.codeFound} failed, added to triedCodes`);
-        }
-        if (exec.trapDetected) break;
-      }
-    }
-  }
-
+  // Phase 3: vision fallback LAST
   if (withinDeadline(deadline)) {
     const img = await screenshot(page, `combined-step-${stepNumber}`);
     const { parsed } = await callGemini<CombinedResult>(
@@ -1175,16 +1282,20 @@ async function solveStep(
       256
     );
 
-    if (parsed.code && parsed.code !== "NONE" && !triedCodes.has(parsed.code)) {
+    const candidate = (parsed.code || "").trim();
+    if (candidate && candidate !== "NONE" && isValidCode(candidate) && !triedCodes.has(candidate)) {
       try {
-        await submitCodeSafe(page, parsed.code, deadline);
+        await submitCodeSafe(page, candidate, deadline);
         const verify = await verifyStep(page, stepNumber);
         if (verify.advanced || verify.completed) return { success: true };
-        triedCodes.add(parsed.code);
-        console.log(`  [STALE] code ${parsed.code} failed, added to triedCodes`);
+
+        triedCodes.add(candidate);
+        console.log(`  [STALE] code ${candidate} failed, added to triedCodes`);
       } catch {
         console.log(`  [WARN] Vision fallback submit failed for step ${stepNumber}`);
       }
+    } else if (candidate && candidate !== "NONE" && !isValidCode(candidate)) {
+      console.log(`  [VISION] Ignoring invalid code "${candidate}"`);
     }
   }
 
