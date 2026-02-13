@@ -336,8 +336,8 @@ interface VisibleCodeCandidate {
 }
 
 const CODE_CONTEXT_HINTS = /\\b(code|enter|submit|verification|verify|access|passcode|otp)\\b/i;
-const CSS_UNIT_SUFFIX_RE = /^(?=.*\\d)[A-Za-z0-9]+(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
-const UNIT_SUFFIX_ONLY_RE = /^(\\d+)(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
+const CSS_UNIT_SUFFIX_RE = /^(?=.*\d)[A-Za-z0-9]+(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
+const UNIT_SUFFIX_ONLY_RE = /^(\d+)(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
 
 const EXTRACT_VISIBLE_CODES_SCRIPT = `(function() {
   var text = (document.body ? document.body.innerText : "") || "";
@@ -378,7 +378,7 @@ function isPlausibleCodeCandidate(code: string): boolean {
   if (/^#?[0-9a-fA-F]{6}$/.test(normalized)) return false;
   if (CSS_UNIT_SUFFIX_RE.test(normalized.toLowerCase())) return false;
   if (UNIT_SUFFIX_ONLY_RE.test(normalized.toLowerCase())) return false;
-  if (/^\\d+[a-z]{1,3}$/i.test(normalized)) return false;
+  if (/^\d+[a-z]{1,3}$/i.test(normalized)) return false;
   if (normalized.toUpperCase().includes("PASS")) return false;
   return true;
 }
@@ -1740,7 +1740,9 @@ async function runVisionSkill(
   deadline: number,
   turn: number,
   triedCodes: Set<string>,
-  beforeSignature: string
+  beforeSignature: string,
+  exploredPass: number,
+  triedEids: Set<string>
 ): Promise<VisionSkillResult> {
   const start = now();
   const result: VisionSkillResult = {
@@ -1814,6 +1816,7 @@ async function runVisionSkill(
     }
 
     result.success = true;
+    triedEids.add(eid);
     result.clickedEid = eid;
     try {
       await page.locator(`[data-agent-eid="${eid}"]`).click({ timeout: 900 });
@@ -1852,13 +1855,72 @@ async function runVisionSkill(
   }
 
   // explore fallback strategy
+  const strategy = Math.max(1, exploredPass);
   await restoreOverlayShields(page);
-  await page.evaluate("window.scrollTo({ top: 0, left: 0, behavior: 'auto' })").catch(() => undefined);
-  await waitForStability(page, 150);
+
+  if (strategy === 1) {
+    await page
+      .evaluate(`(function() {
+        var scrolling = document.scrollingElement || document.documentElement || document.body;
+        if (scrolling) scrolling.scrollTo(0, scrolling.scrollHeight || 0);
+      })()`)
+      .catch(() => undefined);
+  } else if (strategy === 2) {
+    const ranked = buildTopCandidates(snap);
+    const candidate = ranked.find((item) => !triedEids.has(item.eid));
+    if (candidate) {
+      result.success = true;
+      result.clickedEid = candidate.eid;
+      triedEids.add(candidate.eid);
+      try {
+        await page.locator(`[data-agent-eid="${candidate.eid}"]`).click({ timeout: 900 });
+      } catch {
+        const jsClicked = await page
+          .evaluate(`(function(eid) {
+            var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+            if (!el) return false;
+            try { el.click(); return true; } catch (e) { return false; }
+          })("${candidate.eid}")`)
+          .catch(() => false);
+        if (!jsClicked) {
+          await page.keyboard.press("Enter").catch(() => undefined);
+        }
+      }
+    }
+  } else if (strategy === 3) {
+    for (let i = 0; i < 3; i += 1) {
+      await pressEscape(page).catch(() => undefined);
+      await waitForStability(page, 70);
+    }
+    await page.evaluate(`(function() {
+      var scrolling = document.scrollingElement || document.documentElement || document.body;
+      if (!scrolling) return;
+      var target = Math.max(0, Math.floor((scrolling.scrollHeight - window.innerHeight) / 2));
+      scrolling.scrollTo(0, target);
+    })()`).catch(() => undefined);
+  } else {
+    const maxScrollY = await page
+      .evaluate(() => {
+        var scrolling = document.scrollingElement || document.documentElement || document.body;
+        if (!scrolling) return 0;
+        return Math.max(0, scrolling.scrollHeight - window.innerHeight);
+      })
+      .catch(() => 0) as number;
+    const randomY = maxScrollY > 0 ? Math.floor(Math.random() * (maxScrollY + 1)) : 0;
+    await page
+      .evaluate(`(function(y) {
+        var scrolling = document.scrollingElement || document.documentElement || document.body;
+        if (scrolling) scrolling.scrollTo(0, y);
+      })(${randomY})`)
+      .catch(() => undefined);
+    await dismissOverlays(page, Math.min(deadline, now() + 900));
+  }
+
+  await waitForStability(page, 180);
   const after = await captureDOMSnapshot(page);
   result.changed = buildStateSignature(after, await readScrollY(page)) !== beforeSignature;
+  result.success = result.success || result.changed;
   result.elapsed_ms = now() - start;
-  result.success = result.changed;
   return result;
 }
 
@@ -1870,6 +1932,9 @@ async function solveStep(
 ): Promise<{ success: boolean; error?: string }> {
   const deadline = now() + STEP_DEADLINE_MS;
   const triedCodes = new Set<string>(globalFailedCodes);
+  const triedEids = new Set<string>();
+  let explorePass = 0;
+  stateRepeatLog.clear();
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
     await restoreOverlayShields(page);
@@ -1914,6 +1979,10 @@ async function solveStep(
       state
     );
 
+    if (decision.skill === "explore") {
+      explorePass += 1;
+    }
+
     console.log(`[VISION_DECISION] turn=${turn} step=${stepNumber} attempt=${attempt} skill=${decision.skill} reasoning=${decision.reasoning}`);
 
     const result = await runVisionSkill(
@@ -1923,7 +1992,9 @@ async function solveStep(
       deadline,
       turn,
       triedCodes,
-      currentSignature
+      currentSignature,
+      explorePass,
+      triedEids
     );
 
     const skillLog: SkillLog = {
