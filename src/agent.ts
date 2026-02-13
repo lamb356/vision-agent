@@ -22,7 +22,7 @@ import {
   extractCodesFromDOM,
 } from "./browser.js";
 
-const STEP_DEADLINE_MS = 15000;
+const STEP_DEADLINE_MS = 45000;
 const MAX_STEP_ATTEMPTS = 2;
 const DISMISS_TIME_CAP_MS = 2500;
 const MAX_DISMISS_ROUNDS = 3;
@@ -806,20 +806,21 @@ async function restoreOverlayShields(page: Page): Promise<void> {
     for (var i = 0; i < shielded.length; i++) {
       var node = shielded[i];
       if (!(node instanceof HTMLElement)) continue;
-      var previous = node.getAttribute("data-overlay-shield-old-pointer-events");
-      if (previous && previous.length > 0) {
-        node.style.pointerEvents = previous;
+      var previousVisibility = node.getAttribute("data-overlay-shield-old-visibility");
+      if (previousVisibility && previousVisibility.length > 0) {
+        node.style.visibility = previousVisibility;
       } else {
-        node.style.removeProperty("pointer-events");
+        node.style.removeProperty("visibility");
       }
       node.removeAttribute("data-overlay-shield");
+      node.removeAttribute("data-overlay-shield-old-visibility");
       node.removeAttribute("data-overlay-shield-old-pointer-events");
     }
   })()`).catch(() => undefined);
 }
 
 async function dismissOverlays(page: Page, deadline: number): Promise<void> {
-  // Reversible overlay cleanup: click close controls + Escape, fallback to pointer-events shim.
+  // Reversible overlay cleanup: click close controls + Escape, fallback to visibility shim.
   await page.evaluate(`(function() {
     var toDisable = [];
     var all = document.querySelectorAll("*");
@@ -859,11 +860,18 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
 
       if (overlay.dataset && overlay.dataset.overlayShield === "1") continue;
 
-      var oldPointerEvents = overlay.style.pointerEvents || "";
-      overlay.style.pointerEvents = "none";
-      if (overlay instanceof HTMLElement) {
-        overlay.dataset.overlayShield = "1";
-        overlay.dataset.overlayShieldOldPointerEvents = oldPointerEvents;
+      var oldVisibility = overlay.style.visibility || "";
+      var usedSemanticClose = false;
+      if (closeText) {
+        try { closeText.click(); usedSemanticClose = true; } catch (_) {}
+      }
+
+      if (!usedSemanticClose) {
+        overlay.style.visibility = "hidden";
+        if (overlay instanceof HTMLElement) {
+          overlay.dataset.overlayShield = "1";
+          overlay.dataset.overlayShieldOldVisibility = oldVisibility;
+        }
       }
     }
   })()`).catch(() => undefined);
@@ -1696,7 +1704,8 @@ async function chooseVisionSkill(
   stepNumber: number,
   attempt: number,
   turn: number,
-  state: VisionSkillPlanState
+  state: VisionSkillPlanState,
+  dismissTriedThisAttempt: boolean
 ): Promise<VisionSkillDecision> {
   const candidates = buildTopCandidates(snap);
   if (state.stuck) {
@@ -1722,7 +1731,13 @@ async function chooseVisionSkill(
       256
     );
 
-    return sanitizeVisionDecision(raw.parsed, snap, state);
+    const parsed = sanitizeVisionDecision(raw.parsed, snap, state);
+    if (dismissTriedThisAttempt && parsed.skill === "dismiss_overlays") {
+      parsed.skill = "scroll_search";
+      parsed.params = {};
+      parsed.reasoning = `${parsed.reasoning} (dismiss already attempted this attempt)`;
+    }
+    return parsed;
   } catch (err) {
     console.log(`  [VISION_DECISION] fallback decision due to Gemini error: ${err instanceof Error ? err.message : `${err}`}`);
     return {
@@ -1935,6 +1950,7 @@ async function solveStep(
   const triedEids = new Set<string>();
   let explorePass = 0;
   stateRepeatLog.clear();
+  let dismissTriedThisAttempt = false;
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
     await restoreOverlayShields(page);
@@ -1976,7 +1992,8 @@ async function solveStep(
       stepNumber,
       attempt,
       turn,
-      state
+      state,
+      dismissTriedThisAttempt
     );
 
     if (decision.skill === "explore") {
@@ -1996,6 +2013,10 @@ async function solveStep(
       explorePass,
       triedEids
     );
+
+    if (decision.skill === "dismiss_overlays" && !result.changed) {
+      dismissTriedThisAttempt = true;
+    }
 
     const skillLog: SkillLog = {
       step: stepNumber,
