@@ -31,6 +31,10 @@ const MAX_SCOUT_ACTIONS = 25;
 const SCROLL_SWEEPS = 5;
 const RADIO_BRUTEFORCE_LIMIT = 8;
 const RUN_DEADLINE_MS = 10 * 60 * 1000;
+const MAX_VISION_SKILL_TURNS = 12;
+const MAX_STATE_REPEAT = 3;
+const MAX_SCROLL_SEARCH_SWEEPS = 16;
+const SCROLL_SEARCH_STEP_RATIO = 0.8;
 
 const PRIMARY_SCOUT_PROMPT = `You are the PRIMARY solver for a browser-navigation challenge step.
 
@@ -72,6 +76,56 @@ Rules:
 - You may output up to 25 actions.
 - Keep the plan coherent and ordered (sequence matters).`;
 
+const VISION_SKILL_PROMPT = `You are a deterministic vision-first browser navigation skill router.
+
+Mission:
+- Use the screenshot as the primary input.
+- Use DOM JSON only as a compact supplement.
+- Output EXACTLY ONE skill object per turn.
+
+Context:
+- Keep pushing the state forward one step at a time.
+- Decoding is done by Playwright; you only choose a safe skill.
+
+Allowed skills:
+- scroll_search: scroll down the main page in small increments to reveal hidden content.
+- dismiss_overlays: clear blocking popups/traps and continue.
+- click_candidate: click exactly one visible candidate EID (from top candidates list).
+- submit_code: submit a 6-char alphanumeric code only if valid.
+- explore: strategy switch when stuck (state repeated).
+
+When choosing click_candidate, prefer the candidate from the Top-K list and avoid obvious traps.
+When stuck (same state seen repeatedly), favor explore or dismiss_overlays.
+
+Return JSON matching:
+{
+  "skill": "<one of skills>",
+  "params": {
+    "eid": "<EID for click_candidate>",
+    "code": "<6-char code for submit_code>",
+    "maxScrolls": "<optional number>"
+  },
+  "reasoning": "short reason"
+}
+
+Reasoning should be brief and mention confidence, blockers, and why the chosen skill is safest.
+`;
+
+const VISION_SKILL_FEW_SHOT_EXAMPLES = `
+Example decisions:
+1) UI hints say "keep scrolling"; button list is long/uncertain.
+{"skill":"scroll_search","params":{"maxScrolls":8},"reasoning":"Scrolling is required to reveal target below the fold."}
+
+2) "Wrong Button" or popup text is visible; a close control is present.
+{"skill":"dismiss_overlays","params":{},"reasoning":"Need to clear blocking dialog before interacting."}
+
+3) Vision shows one clear target candidate at bottom and it looks top-most/clickable.
+{"skill":"click_candidate","params":{"eid":"E023"},"reasoning":"Best candidate is a standalone action target, no known blockers."}
+
+4) A 6-char code is clearly visible near code-entry text.
+{"skill":"submit_code","params":{"code":"A1B2C3"},"reasoning":"Code is present and ready to submit."}
+`;
+
 interface DOMSnapshot {
   url: string;
   stepHintText: string;
@@ -95,6 +149,7 @@ interface DOMSnapshot {
     ariaLabel: string;
     inDialog: string | null;
     visible: boolean;
+    topmostAtCenter: boolean;
     bbox: [number, number, number, number]; // [x,y,w,h] in viewport coords
   }>;
   scrollables: Array<{ eid: string; inDialog: string | null }>;
@@ -156,6 +211,69 @@ interface ScoutResult {
   confidence: number;
 }
 
+type VisionSkill = "scroll_search" | "dismiss_overlays" | "click_candidate" | "submit_code" | "explore";
+
+interface VisionSkillDecision {
+  skill: VisionSkill;
+  params: {
+    eid?: string;
+    code?: string;
+    maxScrolls?: number;
+  };
+  reasoning: string;
+}
+
+const VISION_MAX_TOP_CANDIDATES = 8;
+
+interface VisionSkillPlanState {
+  stepSignature: string;
+  repeatCount: number;
+  stuck: boolean;
+}
+
+interface VisionSkillResult {
+  success: boolean;
+  code: string | null;
+  changed: boolean;
+  clickedEid: string | null;
+  elapsed_ms: number;
+}
+
+interface CandidateForClick {
+  eid: string;
+  text: string;
+  ariaLabel: string;
+  visible: boolean;
+  inDialog: string | null;
+  score: number;
+  topmostAtCenter: boolean;
+  bbox: [number, number, number, number];
+}
+
+const visionSkillSchema: GeminiSchema = {
+  type: "OBJECT",
+  properties: {
+    skill: {
+      type: "STRING",
+      enum: ["scroll_search", "dismiss_overlays", "click_candidate", "submit_code", "explore"],
+      description: "Single skill for this turn.",
+    },
+    params: {
+      type: "OBJECT",
+      properties: {
+        eid: { type: "STRING" },
+        code: { type: "STRING" },
+        maxScrolls: { type: "INTEGER" },
+      },
+    },
+    reasoning: { type: "STRING" },
+  },
+  required: ["skill", "params", "reasoning"],
+};
+
+const stateRepeatLog: Map<string, number> = new Map();
+const globalFailedCodes: Set<string> = new Set();
+
 const scoutSchema: GeminiSchema = {
   type: "OBJECT",
   properties: {
@@ -212,21 +330,57 @@ function clampText(text: string, maxLength: number): string {
 
 // Extract codes ONLY from visible text (innerText), not attributes/hidden DOM.
 // This prevents phantom codes like BJK5AQ that come from data-* attributes or hidden nodes.
+interface VisibleCodeCandidate {
+  code: string;
+  context: string;
+}
+
+const CODE_CONTEXT_HINTS = /\\b(code|enter|submit|verification|verify|access|passcode|otp)\\b/i;
+const CSS_UNIT_SUFFIX_RE = /^(?=.*\\d)[A-Za-z0-9]+(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
+const UNIT_SUFFIX_ONLY_RE = /^(\\d+)(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
+
 const EXTRACT_VISIBLE_CODES_SCRIPT = `(function() {
   var text = (document.body ? document.body.innerText : "") || "";
-  var re = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/g;
+  var re = /\\b[A-Za-z0-9]{6}\\b/g;
   var out = [];
   var seen = {};
   var m;
-  while ((m = re.exec(text)) && out.length < 25) {
+
+  while ((m = re.exec(text)) && out.length < 40) {
+    var idx = m.index;
     var c = m[0];
-    if (!seen[c]) { seen[c] = true; out.push(c); }
+    if (seen[c]) continue;
+    seen[c] = true;
+
+    var start = Math.max(0, idx - 90);
+    var end = Math.min(text.length, idx + c.length + 90);
+    out.push({
+      code: c,
+      context: (text.substring(start, end) || "").toLowerCase(),
+    });
   }
   return out;
 })()`;
 
+async function extractVisibleCodesWithContext(page: Page): Promise<VisibleCodeCandidate[]> {
+  return (await page.evaluate(EXTRACT_VISIBLE_CODES_SCRIPT)) as VisibleCodeCandidate[];
+}
+
 async function extractVisibleCodes(page: Page): Promise<string[]> {
-  return (await page.evaluate(EXTRACT_VISIBLE_CODES_SCRIPT)) as string[];
+  const found = await extractVisibleCodesWithContext(page);
+  return found.map((item) => item.code);
+}
+
+function isPlausibleCodeCandidate(code: string): boolean {
+  const normalized = code.trim();
+  if (!/^[A-Za-z0-9]{6}$/.test(normalized)) return false;
+  if (!/(?=.*[A-Za-z])(?=.*[0-9])/.test(normalized)) return false;
+  if (/^#?[0-9a-fA-F]{6}$/.test(normalized)) return false;
+  if (CSS_UNIT_SUFFIX_RE.test(normalized.toLowerCase())) return false;
+  if (UNIT_SUFFIX_ONLY_RE.test(normalized.toLowerCase())) return false;
+  if (/^\\d+[a-z]{1,3}$/i.test(normalized)) return false;
+  if (normalized.toUpperCase().includes("PASS")) return false;
+  return true;
 }
 
 // Log the DOM source of a phantom code once (debugging where it comes from)
@@ -279,21 +433,25 @@ async function logDomOnlyCodeSourceOnce(page: Page, code: string): Promise<void>
 function pickCode(codes: Array<{ code: string; score: number }>, exclude?: Set<string>): string | null {
   const normalized = codes
     .map((c) => c.code.trim())
-    .filter((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code))
+    .filter((code) => isPlausibleCodeCandidate(code))
     .filter((code) => !exclude || !exclude.has(code));
   if (normalized.length > 0) return normalized[0];
   return null;
 }
 
 async function checkForCode(page: Page, exclude?: Set<string>): Promise<string | null> {
-  // Only accept codes that appear in visible text (innerText).
-  const visible = await extractVisibleCodes(page).catch(() => []);
-  const candidate =
-    visible
-      .map((c) => c.trim())
-      .find((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code) && (!exclude || !exclude.has(code))) ?? null;
+  const visible = await extractVisibleCodesWithContext(page).catch(() => []);
+  const contextual = visible
+    .filter((item) => isPlausibleCodeCandidate(item.code))
+    .filter((item) => !exclude || !exclude.has(item.code))
+    .filter((item) => CODE_CONTEXT_HINTS.test(item.context));
+  if (contextual.length > 0) return contextual[0].code;
 
-  if (candidate) return candidate;
+  const anywhere = visible
+    .map((item) => item.code)
+    .filter((code) => isPlausibleCodeCandidate(code))
+    .filter((code) => !exclude || !exclude.has(code));
+  if (anywhere.length > 0) return anywhere[0];
 
   // Debug: if extractCodesFromDOM is finding something that innerText doesn't contain,
   // log where it's coming from once (this is how you catch phantom data-attribute codes).
@@ -410,6 +568,16 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
     return text.length > maxLen ? text.slice(0, maxLen) : text;
   }
 
+  function isTopmostAtPoint(el) {
+    if (!el) return false;
+    var rect = el.getBoundingClientRect();
+    var cx = rect.x + rect.width / 2;
+    var cy = rect.y + rect.height / 2;
+    if (!isFinite(cx) || !isFinite(cy)) return false;
+    var top = document.elementFromPoint(cx, cy);
+    return top === el || (top && el.contains(top));
+  }
+
   var dialogElements = Array.from(
     document.querySelectorAll(dialogSelectors.join(","))
   ).filter(function(el) { return el.getAttribute("data-agent-eid"); });
@@ -494,6 +662,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
         ariaLabel: truncate(el.getAttribute("aria-label") || "", 80),
         inDialog: inDialog,
         visible: isVisible(el),
+        topmostAtCenter: isTopmostAtPoint(el),
         bbox: [
           Math.round(rect.x),
           Math.round(rect.y),
@@ -550,7 +719,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
 async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
   const codeList = (await extractVisibleCodes(page))
     .map((c) => c.trim())
-    .filter((code) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code));
+    .filter(isPlausibleCodeCandidate);
 
   const snapshot = await page.evaluate(CAPTURE_DOM_SNAPSHOT_SCRIPT) as any;
 
@@ -631,9 +800,28 @@ async function executeAction(page: Page, action: AgentAction): Promise<ExecResul
   };
 }
 
-async function dismissOverlays(page: Page, deadline: number): Promise<void> {
-  // Nuclear overlay removal: forcefully remove blocking overlays from DOM
+async function restoreOverlayShields(page: Page): Promise<void> {
   await page.evaluate(`(function() {
+    var shielded = document.querySelectorAll('[data-overlay-shield="1"]');
+    for (var i = 0; i < shielded.length; i++) {
+      var node = shielded[i];
+      if (!(node instanceof HTMLElement)) continue;
+      var previous = node.getAttribute("data-overlay-shield-old-pointer-events");
+      if (previous && previous.length > 0) {
+        node.style.pointerEvents = previous;
+      } else {
+        node.style.removeProperty("pointer-events");
+      }
+      node.removeAttribute("data-overlay-shield");
+      node.removeAttribute("data-overlay-shield-old-pointer-events");
+    }
+  })()`).catch(() => undefined);
+}
+
+async function dismissOverlays(page: Page, deadline: number): Promise<void> {
+  // Reversible overlay cleanup: click close controls + Escape, fallback to pointer-events shim.
+  await page.evaluate(`(function() {
+    var toDisable = [];
     var all = document.querySelectorAll("*");
     var vw = window.innerWidth || 1;
     var vh = window.innerHeight || 1;
@@ -642,30 +830,40 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       var style = window.getComputedStyle(el);
-      var pos = style.position;
-      if (pos !== "fixed" && pos !== "absolute") continue;
+      if (style.position !== "fixed" && style.position !== "absolute") continue;
 
-      var z = parseInt(style.zIndex, 10);
-      if (isNaN(z) || z <= 99) continue;
+      if (el.closest("body") !== document.body) continue;
 
-      // don't remove real interactive containers
-      if (el.querySelector("input, textarea, select")) continue;
+      var z = parseInt(style.zIndex || "0", 10);
+      if (isNaN(z) || z < 90) continue;
 
       var text = (el.innerText || "").toLowerCase();
-      if (/step\\s+\\d/.test(text)) continue;
-
       var rect = el.getBoundingClientRect();
       var area = Math.max(0, rect.width) * Math.max(0, rect.height);
       var big = area > vArea * 0.2;
+      var hasKeyword = /prize|won|congratulations|winner|reward|alert|wrong button|wrong choice|prize popup/i.test(text);
+      var semiTransparent = (parseFloat(style.opacity || "1") < 1);
+      var isBackdrop = big && el.children.length === 0 && text.length < 60;
 
-      var hasKeyword = /prize|won|congratulations|winner|reward|alert/i.test(text);
-      var semiTransparent = (parseFloat(style.opacity) < 1);
+      if ((hasKeyword || isBackdrop || (semiTransparent && big)) && big) {
+        toDisable.push(el);
+      }
+    }
 
-      var dominated = hasKeyword || (semiTransparent && big);
-      var isBackdrop = big && el.children.length === 0 && text.trim().length === 0;
+    for (var j = 0; j < toDisable.length; j++) {
+      var overlay = toDisable[j];
+      var closeText = overlay.querySelector('button[aria-label="Close"], [aria-label*="close" i], .close-button, .btn-close, [data-dismiss], [data-bs-dismiss]');
+      if (closeText) {
+        try { closeText.click(); } catch (_) {}
+      }
 
-      if (dominated || isBackdrop) {
-        el.remove();
+      if (overlay.dataset && overlay.dataset.overlayShield === "1") continue;
+
+      var oldPointerEvents = overlay.style.pointerEvents || "";
+      overlay.style.pointerEvents = "none";
+      if (overlay instanceof HTMLElement) {
+        overlay.dataset.overlayShield = "1";
+        overlay.dataset.overlayShieldOldPointerEvents = oldPointerEvents;
       }
     }
   })()`).catch(() => undefined);
@@ -698,8 +896,8 @@ async function dismissOverlays(page: Page, deadline: number): Promise<void> {
     let dismissed = 0;
     for (const sel of dismissSelectors) {
       if (!withinDeadline(deadline)) break;
-      const loc = page.locator(sel);
-      const count = await loc.count().catch(() => 0);
+    const loc = page.locator(sel);
+    const count = await loc.count().catch(() => 0);
       for (let i = 0; i < count && withinDeadline(deadline); i += 1) {
         const target = loc.nth(i);
         if (await target.isVisible({ timeout: 200 }).catch(() => false)) {
@@ -1309,138 +1507,461 @@ async function buildScoutActions(
   return filtered.slice(0, MAX_SCOUT_ACTIONS);
 }
 
+function buildStateSignature(snap: DOMSnapshot, scrollY: number): string {
+  return JSON.stringify({
+    url: snap.url,
+    stepHint: snap.stepHintText.slice(0, 90).toLowerCase(),
+    activeDialog: snap.activeDialogEid ?? "none",
+    codeCount: snap.codesFound.length,
+    visibleButtons: snap.clickables.filter((c) => c.visible).length,
+    totalButtons: snap.features.totalButtons,
+    totalInputs: snap.features.totalInputs,
+    hasCodeVisible: snap.features.hasCodeVisible,
+    hasRevealText: snap.features.hasRevealText,
+    scrollBucket: Math.round(scrollY / 50),
+  });
+}
+
+async function readScrollY(page: Page): Promise<number> {
+  return page.evaluate("Math.max(0, Math.round(window.scrollY || 0))") as Promise<number>;
+}
+
+function scoreCandidateForVision(c: DOMSnapshot["clickables"][number]): number {
+  let score = 0;
+  const signal = `${c.text} ${c.ariaLabel}`.toLowerCase();
+
+  if (c.visible) score += 4;
+  if (c.topmostAtCenter) score += 3;
+
+  if (/(navigation|continue|next|proceed|advance|go|open|submit|confirm|send|code|start)/i.test(signal)) score += 3;
+  if (/(wrong|wrong button|wrong choice|alert|prize|won|decoy|try this|click here|next page)/i.test(signal)) score -= 3;
+
+  return score;
+}
+
+function buildTopCandidates(snap: DOMSnapshot): CandidateForClick[] {
+  return snap.clickables
+    .filter((c) => c.visible)
+    .map((c) => ({
+      eid: c.eid,
+      text: c.text,
+      ariaLabel: c.ariaLabel,
+      visible: c.visible,
+      inDialog: c.inDialog,
+      topmostAtCenter: c.topmostAtCenter,
+      score: scoreCandidateForVision(c),
+      bbox: c.bbox,
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, VISION_MAX_TOP_CANDIDATES);
+}
+
+async function captureVisionScreenshot(
+  page: Page,
+  candidates: CandidateForClick[],
+  label: string
+): Promise<string> {
+  await page.evaluate((items: CandidateForClick[]) => {
+    const previous = document.querySelectorAll('[data-som-overlay="1"]');
+    previous.forEach((node) => node.remove());
+
+    const layer = document.createElement("div");
+    layer.setAttribute("data-som-overlay", "1");
+    layer.style.position = "fixed";
+    layer.style.inset = "0";
+    layer.style.pointerEvents = "none";
+    layer.style.zIndex = "2147483647";
+
+    for (const item of items) {
+      const box = item.bbox;
+      if (!box || box[2] <= 0 || box[3] <= 0) continue;
+      const x = Math.max(0, Math.round(box[0]));
+      const y = Math.max(0, Math.round(box[1]));
+      const w = Math.max(1, Math.round(box[2]));
+      const h = Math.max(1, Math.round(box[3]));
+
+      const rect = document.createElement("div");
+      rect.style.position = "fixed";
+      rect.style.left = `${x}px`;
+      rect.style.top = `${y}px`;
+      rect.style.width = `${w}px`;
+      rect.style.height = `${h}px`;
+      rect.style.border = "2px solid #ff6f00";
+      rect.style.boxSizing = "border-box";
+      rect.style.background = "rgba(255, 111, 0, 0.08)";
+      rect.style.color = "#ff6f00";
+      rect.style.font = "bold 12px Arial, sans-serif";
+      rect.style.textShadow = "0 0 3px rgba(0,0,0,0.7)";
+
+      const tag = document.createElement("div");
+      tag.textContent = item.eid;
+      tag.style.position = "absolute";
+      tag.style.left = "2px";
+      tag.style.top = "2px";
+      tag.style.fontWeight = "700";
+      tag.style.fontSize = "11px";
+      tag.style.color = "#111";
+      tag.style.background = "#ff6f00";
+      tag.style.padding = "1px 3px";
+      rect.appendChild(tag);
+      layer.appendChild(rect);
+    }
+
+    document.body.appendChild(layer);
+  }, candidates).catch(() => undefined);
+
+  const encoded = await screenshot(page, label);
+  await page.evaluate(`(function() { var nodes = document.querySelectorAll('[data-som-overlay="1"]'); nodes.forEach((n) => n.remove()); })()`)
+    .catch(() => undefined);
+  return encoded;
+}
+
+function buildVisionPrompt(
+  snap: DOMSnapshot,
+  stepNumber: number,
+  attempt: number,
+  turn: number,
+  state: VisionSkillPlanState,
+  candidates: CandidateForClick[]
+): string {
+  const payload = {
+    mission: "Pick exactly one safe skill for this turn.",
+    step_number: stepNumber,
+    attempt,
+    turn,
+    state_repeat_count: state.repeatCount,
+    stuck: state.stuck,
+    step_hint: snap.stepHintText.slice(0, 180),
+    visible_codes: snap.codesFound.slice(0, 6),
+    features: snap.features,
+    top_candidates: candidates,
+  };
+
+  return `${VISION_SKILL_PROMPT}\n\n${VISION_SKILL_FEW_SHOT_EXAMPLES}\n\nSTATE_JSON:\n${JSON.stringify(payload)}`;
+}
+
+function sanitizeVisionDecision(
+  parsed: VisionSkillDecision,
+  snap: DOMSnapshot,
+  state: VisionSkillPlanState
+): VisionSkillDecision {
+  const valid = new Set<VisionSkill>([
+    "scroll_search",
+    "dismiss_overlays",
+    "click_candidate",
+    "submit_code",
+    "explore",
+  ]);
+  const knownEids = new Set(snap.clickables.map((c) => c.eid));
+
+  if (!valid.has(parsed.skill)) {
+    parsed.skill = state.stuck ? "explore" : "scroll_search";
+    parsed.params = {};
+  }
+
+  if (parsed.skill === "scroll_search") {
+    const max = parsed.params?.maxScrolls ?? MAX_SCROLL_SEARCH_SWEEPS;
+    parsed.params.maxScrolls = Math.max(1, Math.min(MAX_SCROLL_SEARCH_SWEEPS, max));
+  }
+
+  if (parsed.skill === "click_candidate") {
+    const candidates = buildTopCandidates(snap);
+    const desired = parsed.params?.eid?.trim();
+    if (!desired || !knownEids.has(desired)) {
+      parsed.params.eid = candidates[0]?.eid;
+      if (!parsed.params.eid) {
+        parsed.skill = state.stuck ? "explore" : "dismiss_overlays";
+      }
+    }
+  }
+
+  if (parsed.skill === "submit_code") {
+    const code = (parsed.params?.code ?? "").trim().toUpperCase();
+    if (!isPlausibleCodeCandidate(code)) {
+      parsed.skill = "scroll_search";
+      parsed.params = {};
+    } else {
+      parsed.params.code = code;
+    }
+  }
+
+  parsed.reasoning = parsed.reasoning?.trim() || `fallback: ${parsed.skill}`;
+  return parsed;
+}
+
+async function chooseVisionSkill(
+  page: Page,
+  config: AgentConfig,
+  snap: DOMSnapshot,
+  stepNumber: number,
+  attempt: number,
+  turn: number,
+  state: VisionSkillPlanState
+): Promise<VisionSkillDecision> {
+  const candidates = buildTopCandidates(snap);
+  if (state.stuck) {
+    return {
+      skill: "explore",
+      params: {},
+      reasoning: "state repeated; switching strategy",
+    };
+  }
+
+  try {
+    const prompt = buildVisionPrompt(snap, stepNumber, attempt, turn, state, candidates);
+    const img = await captureVisionScreenshot(
+      page,
+      candidates,
+      `vision-step-${stepNumber}-a${attempt}-t${turn}`
+    );
+    const raw = await callGemini<VisionSkillDecision>(
+      config.apiKey,
+      prompt,
+      img,
+      visionSkillSchema,
+      256
+    );
+
+    return sanitizeVisionDecision(raw.parsed, snap, state);
+  } catch (err) {
+    console.log(`  [VISION_DECISION] fallback decision due to Gemini error: ${err instanceof Error ? err.message : `${err}`}`);
+    return {
+      skill: candidates[0]?.eid ? "click_candidate" : "scroll_search",
+      params: candidates[0]?.eid ? { eid: candidates[0].eid } : {},
+      reasoning: "fallback after Vision model failure",
+    };
+  }
+}
+
+async function runVisionSkill(
+  page: Page,
+  decision: VisionSkillDecision,
+  snap: DOMSnapshot,
+  deadline: number,
+  turn: number,
+  triedCodes: Set<string>,
+  beforeSignature: string
+): Promise<VisionSkillResult> {
+  const start = now();
+  const result: VisionSkillResult = {
+    success: false,
+    code: null,
+    changed: false,
+    clickedEid: null,
+    elapsed_ms: 0,
+  };
+
+  if (decision.skill === "scroll_search") {
+    const maxScrolls = Math.min(MAX_SCROLL_SEARCH_SWEEPS, Math.max(1, decision.params.maxScrolls ?? 6));
+    let lastSignature = beforeSignature;
+    for (let i = 0; i < maxScrolls && withinDeadline(deadline); i += 1) {
+      const beforeY = await readScrollY(page);
+      const viewport = (await page.evaluate("Math.max(1, Math.round(window.innerHeight || 1))")) as number;
+      const delta = Math.max(160, Math.round(viewport * SCROLL_SEARCH_STEP_RATIO));
+      await page.mouse.wheel(0, delta);
+      await waitForStability(page, 170);
+      await dismissOverlays(page, Math.min(deadline, now() + 700));
+
+      const found = await checkForCode(page, triedCodes);
+      if (found) {
+        result.success = true;
+        result.code = found;
+        result.changed = true;
+        result.elapsed_ms = now() - start;
+        return result;
+      }
+
+      const afterSnap = await captureDOMSnapshot(page);
+      const currentSig = buildStateSignature(afterSnap, await readScrollY(page));
+      result.changed = result.changed || currentSig !== lastSignature;
+      lastSignature = currentSig;
+
+      const afterY = await readScrollY(page);
+      if (afterY <= beforeY) {
+        console.log("  [SCROLL_SEARCH] reached bottom or blocked");
+        break;
+      }
+    }
+
+    result.elapsed_ms = now() - start;
+    return result;
+  }
+
+  if (decision.skill === "dismiss_overlays") {
+    await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
+    const after = await captureDOMSnapshot(page);
+    result.changed = buildStateSignature(after, await readScrollY(page)) !== beforeSignature;
+    result.elapsed_ms = now() - start;
+    return result;
+  }
+
+  if (decision.skill === "click_candidate") {
+    const eid = decision.params.eid?.trim();
+    if (!eid) {
+      result.elapsed_ms = now() - start;
+      return result;
+    }
+
+    const candidate = snap.clickables.find((c) => c.eid === eid);
+    if (!candidate || !candidate.visible) {
+      result.elapsed_ms = now() - start;
+      return result;
+    }
+
+    if (!candidate.topmostAtCenter) {
+      await dismissOverlays(page, Math.min(deadline, now() + 1200));
+      await waitForStability(page, 100);
+    }
+
+    result.success = true;
+    result.clickedEid = eid;
+    try {
+      await page.locator(`[data-agent-eid="${eid}"]`).click({ timeout: 900 });
+    } catch {
+      const jsClicked = await page
+        .evaluate(`(function(eid) {
+          var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+          if (!el) return false;
+          try { el.click(); return true; } catch (e) { return false; }
+        })("${eid}")`)
+        .catch(() => false);
+      if (!jsClicked) {
+        await page.keyboard.press("Enter").catch(() => undefined);
+      }
+    }
+    await waitForStability(page, 250);
+
+    const code = await checkForCode(page, triedCodes);
+    if (code) {
+      result.code = code;
+    }
+    result.changed = true;
+    result.elapsed_ms = now() - start;
+    return result;
+  }
+
+  if (decision.skill === "submit_code") {
+    const code = (decision.params.code || "").trim().toUpperCase();
+    if (isPlausibleCodeCandidate(code)) {
+      result.success = true;
+      result.code = code;
+      result.changed = true;
+    }
+    result.elapsed_ms = now() - start;
+    return result;
+  }
+
+  // explore fallback strategy
+  await restoreOverlayShields(page);
+  await page.evaluate("window.scrollTo({ top: 0, left: 0, behavior: 'auto' })").catch(() => undefined);
+  await waitForStability(page, 150);
+  const after = await captureDOMSnapshot(page);
+  result.changed = buildStateSignature(after, await readScrollY(page)) !== beforeSignature;
+  result.elapsed_ms = now() - start;
+  result.success = result.changed;
+  return result;
+}
+
 async function solveStep(
   page: Page,
   config: AgentConfig,
   stepNumber: number,
   attempt: number
-): Promise<{ success: boolean; error?: string }>
-{
+): Promise<{ success: boolean; error?: string }> {
   const deadline = now() + STEP_DEADLINE_MS;
-  const triedCodes = new Set<string>();
+  const triedCodes = new Set<string>(globalFailedCodes);
 
-  const isValidCode = (code: string) => /^(?=.*[0-9])[A-Za-z0-9]{6}$/.test(code.trim());
+  for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
+    await restoreOverlayShields(page);
+    await injectEIDs(page);
+    await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
 
-  await injectEIDs(page);
-  await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-
-  // Phase 0: immediate code check (fast path)
-  const domCode = await checkForCode(page, triedCodes);
-  if (domCode) {
-    await submitCodeSafe(page, domCode, deadline);
-    const verify = await verifyStep(page, stepNumber);
-    if (verify.advanced || verify.completed) return { success: true };
-    triedCodes.add(domCode);
-    console.log(`  [STALE] code ${domCode} failed, added to triedCodes`);
-  }
-
-  // Phase 1: SCOUTS FIRST (navigation/reveal/progress)
-  if (withinDeadline(deadline) && MAX_SCOUT_BATCHES > 0) {
-    for (let batch = 0; batch < MAX_SCOUT_BATCHES && withinDeadline(deadline); batch += 1) {
-      await injectEIDs(page);
-      const scoutSnap = await captureDOMSnapshot(page);
-      const scoutActions = await buildScoutActions(page, config, scoutSnap);
-
-      for (const action of scoutActions) {
-        if (!withinDeadline(deadline)) break;
-
-        if (action.type === "submit_code") {
-          const candidate = action.code.trim();
-
-          // IMPORTANT: filter scout-provided codes (prevents "REVEAL" etc)
-          if (!isValidCode(candidate)) {
-            console.log(`  [SCOUT] Ignoring invalid code "${action.code}"`);
-            continue;
-          }
-          if (triedCodes.has(candidate)) continue;
-
-          await submitCodeSafe(page, candidate, deadline);
-          const verify = await verifyStep(page, stepNumber);
-          if (verify.advanced || verify.completed) return { success: true };
-
-          triedCodes.add(candidate);
-          console.log(`  [STALE] code ${candidate} failed, added to triedCodes`);
-          continue;
-        }
-
-        const exec = await executeAction(page, action);
-
-        // prize/alert traps spawn constantly; clean quickly
-        await dismissOverlays(page, Math.min(deadline, now() + 600));
-
-        // sometimes navigation advances without code appearing yet
-        const verifyAfterAction = await verifyStep(page, stepNumber);
-        if (verifyAfterAction.advanced || verifyAfterAction.completed) return { success: true };
-
-        if (exec.codeFound && !triedCodes.has(exec.codeFound)) {
-          await submitCodeSafe(page, exec.codeFound, deadline);
-          const verify = await verifyStep(page, stepNumber);
-          if (verify.advanced || verify.completed) return { success: true };
-
-          triedCodes.add(exec.codeFound);
-          console.log(`  [STALE] code ${exec.codeFound} failed, added to triedCodes`);
-        }
-
-        if (exec.trapDetected) break;
-      }
-
-      // post-batch check in case code appeared but was missed
-      const codeAfter = await checkForCode(page, triedCodes);
-      if (codeAfter && withinDeadline(deadline)) {
-        await submitCodeSafe(page, codeAfter, deadline);
-        const verify = await verifyStep(page, stepNumber);
-        if (verify.advanced || verify.completed) return { success: true };
-
-        triedCodes.add(codeAfter);
-        console.log(`  [STALE] code ${codeAfter} failed, added to triedCodes`);
-      }
+    const snap = await captureDOMSnapshot(page);
+    const verifyBefore = await verifyStep(page, stepNumber);
+    if (verifyBefore.advanced || verifyBefore.completed) {
+      return { success: true };
     }
-  }
 
-  // Phase 2: skills as accelerators (known patterns) AFTER scouts
-  let snap = await captureDOMSnapshot(page);
-  for (const skill of skills) {
-    if (!withinDeadline(deadline)) break;
-    const result = await runSkill(page, snap, deadline, skill, stepNumber, attempt, triedCodes);
+    const immediateCode = await checkForCode(page, triedCodes);
+    if (immediateCode) {
+      console.log(`  [VISION_FASTPATH] code found before decision: ${immediateCode}`);
+      await submitCodeSafe(page, immediateCode, deadline);
+      const verify = await verifyStep(page, stepNumber);
+      if (verify.advanced || verify.completed) return { success: true };
+      triedCodes.add(immediateCode);
+      globalFailedCodes.add(immediateCode);
+      console.log(`  [STALE] code ${immediateCode} failed, added to triedCodes`);
+      await waitForStability(page, 100);
+    }
+
+    const currentSignature = buildStateSignature(snap, await readScrollY(page));
+    const repeats = (stateRepeatLog.get(currentSignature) ?? 0) + 1;
+    stateRepeatLog.set(currentSignature, repeats);
+
+    const state: VisionSkillPlanState = {
+      stepSignature: currentSignature,
+      repeatCount: repeats,
+      stuck: repeats >= MAX_STATE_REPEAT,
+    };
+
+    const decision = await chooseVisionSkill(
+      page,
+      config,
+      snap,
+      stepNumber,
+      attempt,
+      turn,
+      state
+    );
+
+    console.log(`[VISION_DECISION] turn=${turn} step=${stepNumber} attempt=${attempt} skill=${decision.skill} reasoning=${decision.reasoning}`);
+
+    const result = await runVisionSkill(
+      page,
+      decision,
+      snap,
+      deadline,
+      turn,
+      triedCodes,
+      currentSignature
+    );
+
+    const skillLog: SkillLog = {
+      step: stepNumber,
+      attempt,
+      features: snap.features,
+      skillId: decision.skill,
+      success: result.success,
+      elapsed_ms: result.elapsed_ms,
+      codeFound: result.code,
+    };
+    skillLogs.push(skillLog);
+    console.log(`[VISION_SKILL] ${JSON.stringify(skillLog)}`);
+
     if (result.code && !triedCodes.has(result.code)) {
+      console.log(`  [VISION_CODE] submitting returned code ${result.code}`);
       await submitCodeSafe(page, result.code, deadline);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
-
       triedCodes.add(result.code);
+      globalFailedCodes.add(result.code);
       console.log(`  [STALE] code ${result.code} failed, added to triedCodes`);
-      snap = await captureDOMSnapshot(page);
-      continue;
+      await waitForStability(page, 100);
     }
-    if (!withinDeadline(deadline)) break;
-    snap = await captureDOMSnapshot(page);
-  }
 
-  // Phase 3: vision fallback LAST
-  if (withinDeadline(deadline)) {
-    const img = await screenshot(page, `combined-step-${stepNumber}`);
-    const { parsed } = await callGemini<CombinedResult>(
-      config.apiKey,
-      COMBINED_PROMPT,
-      img,
-      combinedSchema,
-      256
-    );
+    const verifyAfter = await verifyStep(page, stepNumber);
+    if (verifyAfter.advanced || verifyAfter.completed) {
+      return { success: true };
+    }
 
-    const candidate = (parsed.code || "").trim();
-    if (candidate && candidate !== "NONE" && isValidCode(candidate) && !triedCodes.has(candidate)) {
-      try {
-        await submitCodeSafe(page, candidate, deadline);
-        const verify = await verifyStep(page, stepNumber);
-        if (verify.advanced || verify.completed) return { success: true };
+    const postSnap = await captureDOMSnapshot(page);
+    const postSignature = buildStateSignature(postSnap, await readScrollY(page));
+    if (!result.changed && postSignature === currentSignature) {
+      console.log(`  [VISION_LOOP] turn=${turn} no state change`);
+    }
 
-        triedCodes.add(candidate);
-        console.log(`  [STALE] code ${candidate} failed, added to triedCodes`);
-      } catch {
-        console.log(`  [WARN] Vision fallback submit failed for step ${stepNumber}`);
-      }
-    } else if (candidate && candidate !== "NONE" && !isValidCode(candidate)) {
-      console.log(`  [VISION] Ignoring invalid code "${candidate}"`);
+    if (turn === MAX_VISION_SKILL_TURNS && !result.changed) {
+      console.log(`  [VISION_WARN] no change after max turns for step ${stepNumber}`);
     }
   }
 

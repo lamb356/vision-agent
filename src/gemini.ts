@@ -52,6 +52,7 @@ async function rawCall(
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: schema,
+      temperature: 0.3,
       ...(thinkingBudget > 0 ? { thinkingConfig: buildThinkingConfig(thinkingBudget) as any } : {}),
     },
   };
@@ -70,12 +71,25 @@ async function rawCall(
   return resp.json() as Promise<GeminiResponse>;
 }
 
+function normalizeGeminiText(text: string): string {
+  let normalized = text.trim();
+  if (normalized.startsWith("```json")) {
+    normalized = normalized.slice(7);
+  } else if (normalized.startsWith("```")) {
+    normalized = normalized.slice(3);
+  }
+  if (normalized.endsWith("```")) {
+    normalized = normalized.replace(/```$/, "").trim();
+  }
+  return normalized.trim();
+}
+
 function extractJson<T>(response: GeminiResponse): T {
   const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
     throw new Error("No text in Gemini response");
   }
-  return JSON.parse(text) as T;
+  return JSON.parse(normalizeGeminiText(text)) as T;
 }
 
 /**
