@@ -644,6 +644,7 @@ interface HiddenCodeScanResult {
 
 async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResult> {
   const found = await page.evaluate(() => {
+      var __name = function(fn: any) { return fn; };
     var forbidden: Record<string, boolean> = {
       submit: true,
       cancel: true,
@@ -781,6 +782,7 @@ function detectVariant(snap: DOMSnapshot): VariantType {
 async function deepForensicScan(page: Page): Promise<ForensicResult> {
   try {
     const result = await page.evaluate(() => {
+      var __name = function(fn: any) { return fn; };
       var forbidden: Record<string, true> = {
         submit: true,
         cancel: true,
@@ -1028,6 +1030,7 @@ async function strategyClickReveal(page: Page, triedCodes: Set<string>): Promise
   }
 
   const direct = await page.evaluate(() => {
+      var __name = function(fn: any) { return fn; };
     var re = /^[A-Za-z0-9]{6}$/i;
     var out = [];
     var nodes = Array.from(document.querySelectorAll("*"));
@@ -1143,6 +1146,7 @@ function isFillerText(text: string): boolean {
 
 async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
   await page.evaluate(() => {
+      var __name = function(fn: any) { return fn; };
     window.scrollTo(0, document.body.scrollHeight);
   }).catch(() => undefined);
   await waitForStability(page, 500);
@@ -2500,6 +2504,7 @@ async function captureVisionScreenshot(
   await nukeOverlays(page).catch(() => undefined);
 
   await page.evaluate((items: CandidateForClick[]) => {
+      var __name = function(fn: any) { return fn; };
     const previous = document.querySelectorAll('[data-som-overlay="1"]');
     previous.forEach((node) => node.remove());
 
