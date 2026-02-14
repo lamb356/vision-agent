@@ -1002,6 +1002,91 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
   }
 }
 
+type ForensicCandidate = { code: string; source: string };
+
+function collectForensicCodeCandidates(forensics: ForensicResult): ForensicCandidate[] {
+  const candidates: ForensicCandidate[] = [];
+  const seen: Record<string, true> = {};
+  const regex = /[A-Za-z0-9]{6}/g;
+
+  const add = (raw: string, source: string) => {
+    const normalized = normalizeCode(raw);
+    if (!isAllowedCode(normalized)) return;
+    if (seen[normalized]) return;
+    seen[normalized] = true;
+    candidates.push({ code: normalized, source });
+  };
+
+  for (const code of forensics.jsVariableCodes || []) {
+    add(code, "js_variable");
+  }
+
+  for (const code of forensics.cssContentCodes || []) {
+    add(code, "css_content");
+  }
+
+  for (const row of forensics.textNodesWithMixedAlphanumeric || []) {
+    const matches = (row.text || "").match(regex) || [];
+    for (const code of matches) add(code, "inferred_text");
+  }
+
+  for (const row of forensics.invisibleElements || []) {
+    const matches = (row.text || "").match(regex) || [];
+    for (const code of matches) add(code, "invisible_text");
+  }
+
+  for (const row of forensics.dataAttrCodes || []) {
+    const matches = (row.value || "").match(regex) || [];
+    for (const code of matches) add(code, "data_attr");
+  }
+
+  for (const code of forensics.pseudoElementCodes || []) {
+    add(code, "css_pseudo");
+  }
+
+  return candidates;
+}
+
+async function tryForensicCodesFirst(
+  page: Page,
+  codeCandidates: ForensicCandidate[],
+  deadline: number,
+  stepNumber: number,
+  triedCodes: Set<string>,
+  variant: VariantType,
+  strategyUsed: string,
+  attempt: number,
+  maxAttempts = 10
+): Promise<boolean> {
+  const freshCandidates = codeCandidates.filter((item) => !triedCodes.has(item.code));
+  console.log(`[FORENSIC_FIRST] found ${codeCandidates.length} codes from forensic scan, ${freshCandidates.length} are fresh (not yet tried)`);
+
+  const toTry = freshCandidates.slice(0, maxAttempts);
+  for (let index = 0; index < toTry.length; index += 1) {
+    const item = toTry[index];
+    console.log(
+      `[FORENSIC_TRY] attempting code ${item.code} (${index + 1}/${toTry.length}) source=${item.source}`
+    );
+    const submitted = await submitCodeSafe(page, item.code, deadline, stepNumber);
+    if (submitted) {
+      await appendToLearningFile(stepNumber, variant, {
+        strategyUsed,
+        success: true,
+        codeFound: item.code,
+        codeSource: item.source,
+        attemptsUsed: attempt,
+      });
+      return true;
+    }
+
+    triedCodes.add(item.code);
+    globalFailedCodes.add(item.code);
+    console.log(`  [FORENSIC_STALE] code ${item.code} failed, added to triedCodes`);
+  }
+
+  return false;
+}
+
 async function strategyClickReveal(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
   const revealLocator = page.locator(
     'button:has-text("Reveal Code"), [role="button"]:has-text("Reveal Code"), input[type="button"][value*="Reveal Code" i], input[type="submit"][value*="Reveal Code" i]'
@@ -1655,8 +1740,25 @@ async function nukeOverlays(page: Page): Promise<number> {
         var big = area > vArea * 0.3;
         var text = (el.textContent || "").toUpperCase();
         var z = parseInt(style.zIndex || "0", 10);
+        var isHighZ = !isNaN(z) && z >= 9990;
         var highZ = !isNaN(z) && z > 100;
         var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
+
+        if (isHighZ) {
+          var forceTag = (el.tagName || "unknown").toLowerCase();
+          var forceClasses = (el.className || "").toString().trim().replace(/\\s+/g, ".");
+          var forceLabel = forceClasses
+            ? forceTag + "." + forceClasses + " z-index=" + z
+            : forceTag + " z-index=" + z;
+          skipped.push("FORCE:" + forceLabel);
+          var currentForce = el.style.display || "";
+          if (currentForce !== "none") {
+            el.style.display = "none";
+            el.dataset.nuked = "true";
+            nuked += 1;
+          }
+          continue;
+        }
 
         if (big || decoy) {
           if (codePattern.test(text)) {
@@ -1679,7 +1781,22 @@ async function nukeOverlays(page: Page): Promise<number> {
     .then((result) => {
       const typed = result as { nuked: number; skipped: string[] } | null;
       if (typed && typed.skipped && typed.skipped.length > 0) {
-        console.log(`[NUKE_SKIP] preserving potential code elements: ${typed.skipped.join(", ")}`);
+        var preserve = [];
+        var forced = [];
+        for (var i = 0; i < typed.skipped.length; i++) {
+          var value = typed.skipped[i];
+          if (value.indexOf("FORCE:") === 0) {
+            forced.push(value.replace("FORCE:", ""));
+          } else {
+            preserve.push(value);
+          }
+        }
+        if (forced.length > 0) {
+          console.log(`[NUKE_FORCE] removing high-z overlay: ${forced.join(", ")}`);
+        }
+        if (preserve.length > 0) {
+          console.log(`[NUKE_SKIP] preserving potential code elements: ${preserve.join(", ")}`);
+        }
       }
       return typed?.nuked ?? 0;
     })
@@ -1870,6 +1987,59 @@ function selectInputEid(snap: DOMSnapshot): string | null {
   return snap.inputs.find((i) => i.kind !== "hidden")?.eid ?? null;
 }
 
+async function clearSubmitObstructions(page: Page, submitEid?: string | null): Promise<void> {
+  const submitSelector = submitEid ? JSON.stringify(submitEid) : "null";
+  await page.evaluate(`(function(submitEid) {
+    var submitButton = null;
+    if (submitEid) {
+      submitButton = document.querySelector('[data-agent-eid="' + submitEid + '"]');
+    }
+
+    var formRoot = null;
+    var node = submitButton;
+    while (node) {
+      if (node.tagName && node.tagName.toLowerCase() === "form") {
+        formRoot = node;
+        break;
+      }
+      node = node.parentElement;
+    }
+
+    function hasSubmitControl(el) {
+      if (!el || !el.querySelector) return false;
+      return el.querySelector('input[type="text"], input[type="submit"], button[type="submit"]') !== null;
+    }
+
+    var all = document.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var style = window.getComputedStyle(el);
+      var z = parseInt(style.zIndex || "0", 10);
+
+      if (style.position === "fixed" && z > 100) {
+        if (el === submitButton) continue;
+        if (formRoot && formRoot.contains(el)) continue;
+        if (hasSubmitControl(el)) continue;
+        try { el.remove(); } catch (e) {}
+      }
+    }
+
+    for (var j = 0; j < all.length; j++) {
+      var nodeEl = all[j];
+      var s = window.getComputedStyle(nodeEl);
+      var z2 = parseInt(s.zIndex || "0", 10);
+      if ((s.position === "fixed" || s.position === "absolute") && z2 > 50) {
+        if (nodeEl === submitButton) continue;
+        if (formRoot && formRoot.contains(nodeEl)) continue;
+        if (hasSubmitControl(nodeEl) || (nodeEl.matches && nodeEl.matches("input, button")) || nodeEl.tagName === "INPUT" || nodeEl.tagName === "BUTTON") {
+          continue;
+        }
+        try { nodeEl.style.pointerEvents = "none"; } catch (e) {}
+      }
+    }
+  })(${submitSelector})`).catch(() => undefined);
+}
+
 async function submitCodeWithSnapshot(
   page: Page,
   snap: DOMSnapshot,
@@ -1893,9 +2063,9 @@ async function submitCodeWithSnapshot(
   console.log(`  [SUBMIT] submitEid=${submitEid ?? "no submit EID found"}`);
   if (submitEid) {
     const submitLoc = page.locator(`[data-agent-eid="${submitEid}"]`);
-    let clickAttempted = false;
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await clearSubmitObstructions(page, submitEid);
       await nukeOverlays(page).catch(() => undefined);
       if (attempt > 1) {
         console.log(`[SUBMIT_RETRY] attempt ${attempt} after nuking overlays`);
@@ -1913,8 +2083,14 @@ async function submitCodeWithSnapshot(
       try {
         await submitLoc.click({ timeout: 800 });
         console.log(`  [SUBMIT] click succeeded`);
-        clickAttempted = true;
-        break;
+        await waitForStability(page, 1000);
+        const clickVerify = await verifyStep(page, expectedStep, {
+          previousUrl,
+          previousStepText: previousText,
+        }).catch(() => ({ advanced: false, completed: false, error_message: "", current_step: expectedStep }));
+        if (clickVerify.advanced || clickVerify.completed) {
+          return true;
+        }
       } catch {
         if (attempt === 1) {
           console.log(`  [SUBMIT] click failed, dismissing overlays and retrying`);
@@ -1923,33 +2099,31 @@ async function submitCodeWithSnapshot(
       await waitForStability(page, 120);
     }
 
-    if (!clickAttempted) {
-      console.log(`  [SUBMIT] retry failed, attempting JS click`);
-      const jsClicked = await page
-        .evaluate(`(function(eid) {
-          var el = document.querySelector('[data-agent-eid="' + eid + '"]');
-          if (!el) return false;
-          try { el.click(); return true; } catch (e) { return false; }
-        })("${submitEid}")`)
-        .catch(() => false);
+    console.log(`  [SUBMIT] retry failed, attempting JS click`);
+    const jsClicked = await page
+      .evaluate(`(function(eid) {
+        var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+        if (!el) return false;
+        try { el.click(); return true; } catch (e) { return false; }
+      })("${submitEid}")`)
+      .catch(() => false);
 
-      if (jsClicked) {
-        console.log(`  [SUBMIT] JS click dispatched`);
-        await waitForStability(page, 1000);
-        const jsVerify = await verifyStep(page, expectedStep, {
-          previousUrl,
-          previousStepText: previousText,
-        }).catch(() => ({ advanced: false, completed: false, error_message: "", current_step: expectedStep }));
-        if (jsVerify.advanced || jsVerify.completed) {
-          return true;
-        }
+    if (jsClicked) {
+      console.log(`  [SUBMIT] JS click dispatched`);
+      await waitForStability(page, 1000);
+      const jsVerify = await verifyStep(page, expectedStep, {
+        previousUrl,
+        previousStepText: previousText,
+      }).catch(() => ({ advanced: false, completed: false, error_message: "", current_step: expectedStep }));
+      if (jsVerify.advanced || jsVerify.completed) {
+        return true;
+      }
+    } else {
+      console.log(`  [SUBMIT] JS click failed, pressing Enter fallback`);
+      if (inputEid) {
+        await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
       } else {
-        console.log(`  [SUBMIT] JS click failed, pressing Enter fallback`);
-        if (inputEid) {
-          await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
-        } else {
-          await page.keyboard.press("Enter").catch(() => undefined);
-        }
+        await page.keyboard.press("Enter").catch(() => undefined);
       }
     }
   } else {
@@ -2927,6 +3101,27 @@ async function solveStep(
   const strategyUsed = variant === "unknown" ? "vision_skill_loop" : `strategy:${variant}`;
   let attemptForensics: any = null;
 
+  const runForensicFallback = async (): Promise<boolean> => {
+    const forensics = await deepForensicScan(page).catch(() => null);
+    if (!forensics) return false;
+    attemptForensics = forensics;
+    const candidates = collectForensicCodeCandidates(forensics);
+    return await tryForensicCodesFirst(
+      page,
+      candidates,
+      deadline,
+      stepNumber,
+      triedCodes,
+      variant,
+      strategyUsed,
+      attempt
+    );
+  };
+
+  if (await runForensicFallback()) {
+    return { success: true };
+  }
+
   const hintCode = extractCodesFromHint(initialSnap.stepHintText, triedCodes);
   if (hintCode) {
     console.log(`[HINT_CODE] found code ${hintCode} directly in hint text, submitting`);
@@ -2971,6 +3166,9 @@ async function solveStep(
       globalFailedCodes.add(normalizedCode);
       console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
       await waitForStability(page, 100);
+      if (await runForensicFallback()) {
+        return { success: true };
+      }
     } else {
       console.log(`  [STRATEGY_SKIP] code ${normalizedCode} already tried`);
     }
