@@ -23,7 +23,7 @@ import {
 } from "./browser.js";
 
 const STEP_DEADLINE_MS = 45000;
-const MAX_STEP_ATTEMPTS = 2;
+const MAX_STEP_ATTEMPTS = 5;
 const DISMISS_TIME_CAP_MS = 2500;
 const MAX_DISMISS_ROUNDS = 3;
 const MAX_SCOUT_BATCHES = 1;
@@ -89,13 +89,12 @@ Context:
 
 Allowed skills:
 - scroll_search: scroll down the main page in small increments to reveal hidden content.
-- dismiss_overlays: clear blocking popups/traps and continue.
 - click_candidate: click exactly one visible candidate EID (from top candidates list).
 - submit_code: submit a 6-char alphanumeric code only if valid.
 - explore: strategy switch when stuck (state repeated).
 
 When choosing click_candidate, prefer the candidate from the Top-K list and avoid obvious traps.
-When stuck (same state seen repeatedly), favor explore or dismiss_overlays.
+When stuck (same state seen repeatedly), favor explore.
 
 Return JSON matching:
 {
@@ -117,7 +116,7 @@ Example decisions:
 {"skill":"scroll_search","params":{"maxScrolls":8},"reasoning":"Scrolling is required to reveal target below the fold."}
 
 2) "Wrong Button" or popup text is visible; a close control is present.
-{"skill":"dismiss_overlays","params":{},"reasoning":"Need to clear blocking dialog before interacting."}
+{"skill":"explore","params":{},"reasoning":"Need to resolve popup pressure by switching strategy and probing alternatives."}
 
 3) Vision shows one clear target candidate at bottom and it looks top-most/clickable.
 {"skill":"click_candidate","params":{"eid":"E023"},"reasoning":"Best candidate is a standalone action target, no known blockers."}
@@ -211,7 +210,7 @@ interface ScoutResult {
   confidence: number;
 }
 
-type VisionSkill = "scroll_search" | "dismiss_overlays" | "click_candidate" | "submit_code" | "explore";
+type VisionSkill = "scroll_search" | "click_candidate" | "submit_code" | "explore";
 
 interface VisionSkillDecision {
   skill: VisionSkill;
@@ -255,7 +254,7 @@ const visionSkillSchema: GeminiSchema = {
   properties: {
     skill: {
       type: "STRING",
-      enum: ["scroll_search", "dismiss_overlays", "click_candidate", "submit_code", "explore"],
+      enum: ["scroll_search", "click_candidate", "submit_code", "explore"],
       description: "Single skill for this turn.",
     },
     params: {
@@ -285,7 +284,6 @@ const scoutSchema: GeminiSchema = {
           type: {
             type: "STRING",
             enum: [
-              "dismiss_overlays",
               "click_eid",
               "type_eid",
               "check_eid",
@@ -817,6 +815,46 @@ async function restoreOverlayShields(page: Page): Promise<void> {
       node.removeAttribute("data-overlay-shield-old-pointer-events");
     }
   })()`).catch(() => undefined);
+}
+
+async function nukeOverlays(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    var all = document.querySelectorAll("*");
+    var vw = window.innerWidth || 1;
+    var vh = window.innerHeight || 1;
+    var vArea = vw * vh;
+    var decoyPattern = /cookie|consent|newsletter|subscribe|warning|alert|limited time|special offer/i;
+    var nuked = 0;
+
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i] as HTMLElement;
+      if (el.closest("body") !== document.body) continue;
+
+      var style = window.getComputedStyle(el);
+      var position = style.position;
+      if (position !== "fixed" && position !== "absolute") continue;
+      if (el.dataset && el.dataset.nuked === "true") continue;
+
+      var rect = el.getBoundingClientRect();
+      var area = Math.max(0, rect.width) * Math.max(0, rect.height);
+      var big = area > vArea * 0.3;
+      var text = (el.textContent || "").toLowerCase();
+      var z = parseInt(style.zIndex || "0", 10);
+      var highZ = !isNaN(z) && z > 100;
+      var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
+
+      if (big || decoy) {
+        var current = el.style.display || "";
+        if (current !== "none") {
+          el.style.display = "none";
+          el.dataset.nuked = "true";
+          nuked += 1;
+        }
+      }
+    }
+
+    return nuked;
+  }).catch(() => 0) as Promise<number>;
 }
 
 async function dismissOverlays(page: Page, deadline: number): Promise<void> {
@@ -1569,6 +1607,8 @@ async function captureVisionScreenshot(
   candidates: CandidateForClick[],
   label: string
 ): Promise<string> {
+  await nukeOverlays(page).catch(() => undefined);
+
   await page.evaluate((items: CandidateForClick[]) => {
     const previous = document.querySelectorAll('[data-som-overlay="1"]');
     previous.forEach((node) => node.remove());
@@ -1655,7 +1695,6 @@ function sanitizeVisionDecision(
 ): VisionSkillDecision {
   const valid = new Set<VisionSkill>([
     "scroll_search",
-    "dismiss_overlays",
     "click_candidate",
     "submit_code",
     "explore",
@@ -1678,7 +1717,7 @@ function sanitizeVisionDecision(
     if (!desired || !knownEids.has(desired)) {
       parsed.params.eid = candidates[0]?.eid;
       if (!parsed.params.eid) {
-        parsed.skill = state.stuck ? "explore" : "dismiss_overlays";
+        parsed.skill = state.stuck ? "explore" : "scroll_search";
       }
     }
   }
@@ -1704,8 +1743,7 @@ async function chooseVisionSkill(
   stepNumber: number,
   attempt: number,
   turn: number,
-  state: VisionSkillPlanState,
-  dismissTriedThisAttempt: boolean
+  state: VisionSkillPlanState
 ): Promise<VisionSkillDecision> {
   const candidates = buildTopCandidates(snap);
   if (state.stuck) {
@@ -1732,11 +1770,6 @@ async function chooseVisionSkill(
     );
 
     const parsed = sanitizeVisionDecision(raw.parsed, snap, state);
-    if (dismissTriedThisAttempt && parsed.skill === "dismiss_overlays") {
-      parsed.skill = "scroll_search";
-      parsed.params = {};
-      parsed.reasoning = `${parsed.reasoning} (dismiss already attempted this attempt)`;
-    }
     return parsed;
   } catch (err) {
     console.log(`  [VISION_DECISION] fallback decision due to Gemini error: ${err instanceof Error ? err.message : `${err}`}`);
@@ -1800,14 +1833,6 @@ async function runVisionSkill(
       }
     }
 
-    result.elapsed_ms = now() - start;
-    return result;
-  }
-
-  if (decision.skill === "dismiss_overlays") {
-    await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-    const after = await captureDOMSnapshot(page);
-    result.changed = buildStateSignature(after, await readScrollY(page)) !== beforeSignature;
     result.elapsed_ms = now() - start;
     return result;
   }
@@ -1950,7 +1975,6 @@ async function solveStep(
   const triedEids = new Set<string>();
   let explorePass = 0;
   stateRepeatLog.clear();
-  let dismissTriedThisAttempt = false;
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
     await restoreOverlayShields(page);
@@ -1992,8 +2016,7 @@ async function solveStep(
       stepNumber,
       attempt,
       turn,
-      state,
-      dismissTriedThisAttempt
+      state
     );
 
     if (decision.skill === "explore") {
@@ -2013,10 +2036,6 @@ async function solveStep(
       explorePass,
       triedEids
     );
-
-    if (decision.skill === "dismiss_overlays" && !result.changed) {
-      dismissTriedThisAttempt = true;
-    }
 
     const skillLog: SkillLog = {
       step: stepNumber,
@@ -2111,8 +2130,8 @@ export async function runStep(
   let error: string | undefined;
 
   for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt += 1) {
-    attempts = attempt;
-    const result = await solveStep(page, config, stepNumber, attempt);
+      attempts = attempt;
+      const result = await solveStep(page, config, stepNumber, attempt);
     if (result.success) {
       return {
         step: stepNumber,
@@ -2146,6 +2165,7 @@ export async function runAgent(page: Page, config: AgentConfig): Promise<StepRes
     results.push(result);
     if (!result.success) {
       console.log(`Step ${step} failed: ${result.error ?? "unknown"}`);
+      break;
     }
   }
 
