@@ -466,6 +466,61 @@ async function checkForCode(page: Page, exclude?: Set<string>): Promise<string |
   return null;
 }
 
+interface HiddenCodeCandidate {
+  code: string;
+  tagName: string;
+  className: string;
+}
+
+async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeCandidate[]> {
+  const found = await page.evaluate(() => {
+    var re = /\\b[A-Za-z0-9]{6}\\b/g;
+    var out = [];
+    var seen = {} as Record<string, true>;
+    var nodes = Array.from(document.querySelectorAll("*"));
+
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (!node) continue;
+
+      var snippets = [];
+      if (node.textContent) snippets.push(node.textContent);
+      if ((node as any).innerText) snippets.push((node as any).innerText);
+      if ((node as any).value) snippets.push(String((node as any).value));
+
+      if (node.attributes) {
+        for (var j = 0; j < node.attributes.length; j++) {
+          var attr = node.attributes[j];
+          if (attr && /^data-/i.test(attr.name)) {
+            snippets.push(String(attr.value || ""));
+          }
+        }
+      }
+
+      for (var s = 0; s < snippets.length; s++) {
+        var text = snippets[s];
+        if (!text) continue;
+        var m;
+        while ((m = re.exec(text)) !== null) {
+          var code = String(m[0]).toUpperCase();
+          if (seen[code]) continue;
+          seen[code] = true;
+          out.push({
+            code,
+            tagName: (node.tagName || "").toLowerCase(),
+            className: ((node.className || "") as any).toString()
+          });
+        }
+        re.lastIndex = 0;
+      }
+    }
+
+    return out;
+  });
+
+  return (found as HiddenCodeCandidate[]) || [];
+}
+
 async function detectTrap(page: Page): Promise<boolean> {
   const count = await page.locator("text=/Wrong Button|Wrong Choice|decoy/i").count().catch(() => 0);
   return count > 0;
@@ -822,12 +877,15 @@ async function restoreOverlayShields(page: Page): Promise<void> {
 }
 
 async function nukeOverlays(page: Page): Promise<number> {
-  return page.evaluate(() => {
+  return page
+    .evaluate(() => {
     var all = document.querySelectorAll("*");
     var vw = window.innerWidth || 1;
     var vh = window.innerHeight || 1;
     var vArea = vw * vh;
     var decoyPattern = /cookie|consent|newsletter|subscribe|warning|alert|limited time|special offer/i;
+    var codePattern = /\\b[A-Z0-9]{6}\\b/i;
+    var skipped = [];
     var nuked = 0;
 
     for (var i = 0; i < all.length; i++) {
@@ -842,12 +900,18 @@ async function nukeOverlays(page: Page): Promise<number> {
       var rect = el.getBoundingClientRect();
       var area = Math.max(0, rect.width) * Math.max(0, rect.height);
       var big = area > vArea * 0.3;
-      var text = (el.textContent || "").toLowerCase();
+      var text = (el.textContent || "").toUpperCase();
       var z = parseInt(style.zIndex || "0", 10);
       var highZ = !isNaN(z) && z > 100;
       var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
 
       if (big || decoy) {
+        if (codePattern.test(text)) {
+          var tag = (el.tagName || "unknown").toLowerCase();
+          var classes = (el.className || "").toString().trim().replace(/\\s+/g, ".");
+          skipped.push(classes ? `${tag}.${classes}` : tag);
+          continue;
+        }
         var current = el.style.display || "";
         if (current !== "none") {
           el.style.display = "none";
@@ -857,8 +921,16 @@ async function nukeOverlays(page: Page): Promise<number> {
       }
     }
 
-    return nuked;
-  }).catch(() => 0) as Promise<number>;
+    return { nuked, skipped };
+  })
+    .then((result) => {
+      const typed = result as { nuked: number; skipped: string[] } | null;
+      if (typed && typed.skipped && typed.skipped.length > 0) {
+        console.log(`[NUKE_SKIP] preserving potential code elements: ${typed.skipped.join(", ")}`);
+      }
+      return typed?.nuked ?? 0;
+    })
+    .catch(() => 0);
 }
 
 async function dismissOverlays(page: Page, deadline: number): Promise<void> {
@@ -1703,7 +1775,8 @@ function sanitizeVisionDecision(
   snap: DOMSnapshot,
   state: VisionSkillPlanState,
   triedCodes?: Set<string>,
-  forceNonSubmit?: boolean
+  forceNonSubmit?: boolean,
+  consecutiveScrollFails?: number
 ): VisionSkillDecision {
   const valid = new Set<VisionSkill>([
     "scroll_search",
@@ -1719,6 +1792,14 @@ function sanitizeVisionDecision(
   }
 
   if (parsed.skill === "scroll_search") {
+    if (consecutiveScrollFails !== undefined && consecutiveScrollFails >= 2) {
+      const candidates = buildTopCandidates(snap);
+      const fallback = candidates[0]?.eid ? "click_candidate" : "explore";
+      parsed.skill = fallback;
+      parsed.params = fallback === "click_candidate" ? { eid: candidates[0].eid } : {};
+      console.log("[SCROLL_CAP] scroll_search capped after 2 fails, overriding to " + fallback);
+    }
+
     const max = parsed.params?.maxScrolls ?? MAX_SCROLL_SEARCH_SWEEPS;
     parsed.params.maxScrolls = Math.max(1, Math.min(MAX_SCROLL_SEARCH_SWEEPS, max));
   }
@@ -1764,7 +1845,8 @@ async function chooseVisionSkill(
   turn: number,
   state: VisionSkillPlanState,
   triedCodes: Set<string>,
-  forceNonSubmit?: boolean
+  forceNonSubmit?: boolean,
+  consecutiveScrollFails?: number
 ): Promise<VisionSkillDecision> {
   const candidates = buildTopCandidates(snap);
   if (state.stuck) {
@@ -1799,7 +1881,7 @@ async function chooseVisionSkill(
       256
     );
 
-    const parsed = sanitizeVisionDecision(raw.parsed, snap, state, triedCodes, forceNonSubmit);
+    const parsed = sanitizeVisionDecision(raw.parsed, snap, state, triedCodes, forceNonSubmit, consecutiveScrollFails);
     return parsed;
   } catch (err) {
     console.log(`  [VISION_DECISION] fallback decision due to Gemini error: ${err instanceof Error ? err.message : `${err}`}`);
@@ -2005,7 +2087,30 @@ async function solveStep(
   const triedEids = new Set<string>();
   let explorePass = 0;
   let forceNonSubmit = false;
+  let consecutiveScrollFails = 0;
   stateRepeatLog.clear();
+
+  const preLoopHidden = await extractHiddenCodesFromDOM(page).catch(() => []);
+  const freshHiddenCode = preLoopHidden.find((candidate) => !triedCodes.has(candidate.code));
+  if (freshHiddenCode) {
+    const normalizedCode = normalizeCode(freshHiddenCode.code);
+    const classes = freshHiddenCode.className
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+      .join(".");
+    const tagRef = classes ? `${freshHiddenCode.tagName}.${classes}` : freshHiddenCode.tagName;
+    console.log(`  [DOM_HIDDEN_CODE] found code ${normalizedCode} in hidden element ${tagRef}`);
+
+    await submitCodeSafe(page, normalizedCode, deadline);
+    const verify = await verifyStep(page, stepNumber);
+    if (verify.advanced || verify.completed) return { success: true };
+    triedCodes.add(normalizedCode);
+    globalFailedCodes.add(normalizedCode);
+    console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
+    await waitForStability(page, 100);
+  }
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
     await restoreOverlayShields(page);
@@ -2055,7 +2160,8 @@ async function solveStep(
       turn,
       state,
       triedCodes,
-      forceNonSubmit
+      forceNonSubmit,
+      consecutiveScrollFails
     );
     forceNonSubmit = false;
 
@@ -2106,6 +2212,16 @@ async function solveStep(
       globalFailedCodes.add(normalizedCode);
       console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
       await waitForStability(page, 100);
+    }
+
+    if (decision.skill === "scroll_search") {
+      if (!result.success) {
+        consecutiveScrollFails += 1;
+      } else {
+        consecutiveScrollFails = 0;
+      }
+    } else if (result.success) {
+      consecutiveScrollFails = 0;
     }
 
     const verifyAfter = await verifyStep(page, stepNumber);
