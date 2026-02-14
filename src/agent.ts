@@ -7,6 +7,8 @@ import type {
   GeminiSchema,
 } from "./types.js";
 import { callGemini, callGeminiParallel } from "./gemini.js";
+import { readFile, writeFile } from "fs/promises";
+import path from "path";
 import {
   COMBINED_PROMPT,
   START_PROMPT,
@@ -35,6 +37,7 @@ const MAX_VISION_SKILL_TURNS = 12;
 const MAX_STATE_REPEAT = 3;
 const MAX_SCROLL_SEARCH_SWEEPS = 16;
 const SCROLL_SEARCH_STEP_RATIO = 0.8;
+const LEARNING_FILE_PATH = path.resolve(process.cwd(), "learning.json");
 
 const PRIMARY_SCOUT_PROMPT = `You are the PRIMARY solver for a browser-navigation challenge step.
 
@@ -337,6 +340,39 @@ const CODE_CONTEXT_HINTS = /\\b(code|enter|submit|verification|verify|access|pas
 const CSS_UNIT_SUFFIX_RE = /^(?=.*\d)[A-Za-z0-9]+(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
 const UNIT_SUFFIX_ONLY_RE = /^(\d+)(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
 
+type VariantType = "click_reveal" | "hidden_dom" | "radio_checkbox" | "scroll_nav" | "delayed_reveal" | "unknown";
+
+interface StrategyResult {
+  success: boolean;
+  code?: string;
+  codeSource?: string;
+  fallbackToGemini?: boolean;
+  forensics?: any;
+}
+
+interface ForensicResult {
+  totalElements: number;
+  textNodesWithMixedAlphanumeric: { text: string; tag: string; visible: boolean }[];
+  cssContentCodes: string[];
+  invisibleElements: { text: string; opacity: string; color: string; bg: string }[];
+  dataAttrCodes: { tag: string; attr: string; value: string }[];
+  bodyTextSnippet: string;
+  pseudoElementCodes?: string[];
+  jsVariableCodes?: string[];
+}
+
+interface LearningEntry {
+  timestamp: string;
+  stepNumber: number;
+  variant: VariantType;
+  strategyUsed: string;
+  success: boolean;
+  codeFound: string | null;
+  codeSource: string | null;
+  attemptsUsed: number;
+  forensics?: any;
+}
+
 const EXTRACT_VISIBLE_CODES_SCRIPT = `(function() {
   var text = (document.body ? document.body.innerText : "") || "";
   var re = /\\b[A-Za-z0-9]{6}\\b/g;
@@ -383,6 +419,117 @@ function isPlausibleCodeCandidate(code: string): boolean {
 
 function normalizeCode(code: string): string {
   return code.trim().toUpperCase();
+}
+
+const FORBIDDEN_CODE_WORDS: Record<string, true> = {
+  submit: true,
+  cancel: true,
+  button: true,
+  scroll: true,
+  cookie: true,
+  consent: true,
+  warning: true,
+  alert: true,
+  next: true,
+  proceed: true,
+  advance: true,
+  retry: true,
+  close: true,
+  confirm: true,
+  select: true,
+  reveal: true,
+};
+
+const FILLER_NAV_BUTTON_TEXT = [
+  "Proceed Forward",
+  "Keep Going",
+  "Next Section",
+  "Continue Journey",
+  "Move On",
+  "Go Forward",
+  "Next Page",
+  "Proceed",
+];
+
+const VARIANT_HINT_PATTERNS = {
+  clickReveal: /click to reveal|click the button below to reveal|reveal code/i,
+  hiddenDom: /hidden dom|hidden in the dom|hidden code/i,
+  scrollNav: /scroll down to find|scroll to find|keep scrolling/i,
+  delayedReveal: /delayed reveal|will appear after waiting|wait for the code/i,
+};
+
+const CODE_RE = /[A-Za-z0-9]{6}/g;
+const MIXED_CODE_RE = /^(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}$/;
+
+function isAllowedCode(code: string): boolean {
+  return isPlausibleCodeCandidate(code) && !FORBIDDEN_CODE_WORDS[normalizeCode(code).toLowerCase()];
+}
+
+function pickFreshCodeFromCandidates(candidates: string[], triedCodes: Set<string>): string | null {
+  for (const candidate of candidates) {
+    const normalized = normalizeCode(candidate);
+    if (!isAllowedCode(normalized)) continue;
+    if (triedCodes.has(normalized)) continue;
+    return normalized;
+  }
+  return null;
+}
+
+let learningCache: LearningEntry[] | null = null;
+
+async function readLearningFile(): Promise<LearningEntry[]> {
+  if (learningCache) return learningCache;
+  try {
+    const file = await readFile(LEARNING_FILE_PATH, "utf8");
+    const parsed = JSON.parse(file) as LearningEntry[];
+    if (Array.isArray(parsed)) {
+      learningCache = parsed;
+      return parsed;
+    }
+  } catch {}
+  learningCache = [];
+  return learningCache;
+}
+
+function getPreferredCodeSource(entries: LearningEntry[], variant: VariantType): string | null {
+  const counts: Record<string, number> = {};
+  for (const entry of entries) {
+    if (!entry.success || entry.variant !== variant) continue;
+    const source = entry.codeSource || "";
+    if (!source) continue;
+    counts[source] = (counts[source] || 0) + 1;
+  }
+  let bestSource: string | null = null;
+  let bestCount = 0;
+  for (const [source, count] of Object.entries(counts)) {
+    if (count > bestCount) {
+      bestCount = count;
+      bestSource = source;
+    }
+  }
+  return bestSource;
+}
+
+async function appendToLearningFile(
+  stepNumber: number,
+  variant: VariantType,
+  data: Omit<LearningEntry, "timestamp" | "stepNumber" | "variant">
+): Promise<void> {
+  const entries = await readLearningFile();
+  entries.push({
+    timestamp: new Date().toISOString(),
+    stepNumber,
+    variant,
+    ...data,
+  });
+  learningCache = entries;
+  await writeFile(LEARNING_FILE_PATH, JSON.stringify(entries, null, 2), "utf8").catch(() => undefined);
+}
+
+function describeForLearningPrompt(variant: VariantType, entries: LearningEntry[]): string {
+  const source = getPreferredCodeSource(entries, variant);
+  if (!source) return "";
+  return `Based on prior runs, ${variant} steps have been solved by ${source}. Try that approach.`;
 }
 
 // Log the DOM source of a phantom code once (debugging where it comes from)
@@ -570,6 +717,495 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResu
     rawMatches: 0,
     filteredMatches: 0,
   };
+}
+
+function detectVariant(snap: DOMSnapshot): VariantType {
+  const hint = (snap.stepHintText || "").toLowerCase();
+  const hintSnippet = hint.slice(0, 300);
+  if (snap.features.hasRadios || snap.features.hasCheckboxes) {
+    console.log(`[VARIANT] detected: radio_checkbox from hint: "${hintSnippet}"`);
+    return "radio_checkbox";
+  }
+
+  const hasRevealButton = snap.clickables.some(
+    (c) => /reveal code/i.test(c.text) || /reveal code/i.test(c.ariaLabel)
+  );
+  if (
+    (VARIANT_HINT_PATTERNS.clickReveal.test(hint) || /click to reveal/i.test(hint) || /click the button/i.test(hint))
+    && hasRevealButton
+  ) {
+    console.log(`[VARIANT] detected: click_reveal from hint: "${hintSnippet}"`);
+    return "click_reveal";
+  }
+
+  if (VARIANT_HINT_PATTERNS.delayedReveal.test(hint) && !snap.features.hasCodeVisible) {
+    console.log(`[VARIANT] detected: delayed_reveal from hint: "${hintSnippet}"`);
+    return "delayed_reveal";
+  }
+
+  if ((VARIANT_HINT_PATTERNS.hiddenDom.test(hint) && !snap.features.hasCodeVisible)) {
+    console.log(`[VARIANT] detected: hidden_dom from hint: "${hintSnippet}"`);
+    return "hidden_dom";
+  }
+
+  if (VARIANT_HINT_PATTERNS.scrollNav.test(hint) && snap.features.hasScrollable) {
+    console.log(`[VARIANT] detected: scroll_nav from hint: "${hintSnippet}"`);
+    return "scroll_nav";
+  }
+
+  console.log(`[VARIANT] detected: unknown from hint: "${hintSnippet}"`);
+  return "unknown";
+}
+
+async function deepForensicScan(page: Page): Promise<ForensicResult> {
+  try {
+    const result = await page.evaluate(() => {
+      var forbidden: Record<string, true> = {
+        submit: true,
+        cancel: true,
+        button: true,
+        scroll: true,
+        cookie: true,
+        consent: true,
+        warning: true,
+        alert: true,
+        next: true,
+        proceed: true,
+        advance: true,
+        retry: true,
+        close: true,
+        confirm: true,
+      };
+
+      var elements = Array.from(document.querySelectorAll("*"));
+      var textNodesWithMixedAlphanumeric: { text: string; tag: string; visible: boolean }[] = [];
+      var cssContentCodes: string[] = [];
+      var invisibleElements: { text: string; opacity: string; color: string; bg: string }[] = [];
+      var dataAttrCodes: { tag: string; attr: string; value: string }[] = [];
+      var pseudoElementCodes: string[] = [];
+      var jsVariableCodes: string[] = [];
+
+      function visible(el: Element) {
+        var s = window.getComputedStyle(el);
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+      }
+
+      function isAllowed(code: string) {
+        if (!/^([A-Z0-9]{6})$/i.test(code)) return false;
+        if (!/[A-Z]/i.test(code) || !/[0-9]/.test(code)) return false;
+        if (/^#?[0-9a-fA-F]{6}$/.test(code)) return false;
+        if (forbidden[code.toLowerCase()]) return false;
+        return true;
+      }
+
+      function extract(text: string): string[] {
+        var out: string[] = [];
+        if (!text) return out;
+        var m;
+        var regex = /[A-Za-z0-9]{6}/g;
+        while ((m = regex.exec(text)) !== null) {
+          var code = String(m[0]).toUpperCase();
+          if (isAllowed(code)) {
+            out.push(code);
+          }
+        }
+        return out;
+      }
+
+      function pushUnique(target: string[], code: string) {
+        if (target.indexOf(code) === -1) target.push(code);
+      }
+
+      for (var i = 0; i < elements.length; i++) {
+        var el = elements[i] as Element;
+        if (!el) continue;
+
+        var style = window.getComputedStyle(el);
+        var text = "";
+        if ((el as any).textContent) text = String((el as any).textContent || "").trim();
+        var textCodes = extract(text);
+        if (textCodes.length > 0) {
+          textNodesWithMixedAlphanumeric.push({
+            text,
+            tag: (el.tagName || "").toLowerCase(),
+            visible: visible(el),
+          });
+        }
+
+        var opacity = (style.opacity || "1").trim();
+        var color = (style.color || "").trim();
+        var bg = "";
+        try {
+          bg = (window.getComputedStyle(el).backgroundColor || "").trim();
+        } catch (_) {
+          bg = "";
+        }
+
+        var before = "";
+        var after = "";
+        try {
+          before = window.getComputedStyle(el, "::before").getPropertyValue("content") || "";
+          after = window.getComputedStyle(el, "::after").getPropertyValue("content") || "";
+        } catch (_) {}
+
+        var beforeCodes = extract(before);
+        for (var pb = 0; pb < beforeCodes.length; pb += 1) {
+          pushUnique(pseudoElementCodes, beforeCodes[pb]);
+        }
+        var afterCodes = extract(after);
+        for (var pa = 0; pa < afterCodes.length; pa += 1) {
+          pushUnique(pseudoElementCodes, afterCodes[pa]);
+        }
+
+        var left = parseFloat(style.left || "0");
+        var top = parseFloat(style.top || "0");
+        var isInvisible =
+          Number.isFinite(left) &&
+          Number.isFinite(top) &&
+          (parseFloat(opacity) <= 0.01 ||
+            color === bg ||
+            parseFloat(style.fontSize || "16") < 2 ||
+            (style.position === "absolute" && ((left < -1000) || (left > 5000) || (top < -1000) || (top > 5000)) ) ||
+            style.display === "none" ||
+            style.visibility === "hidden");
+        if (isInvisible && (text.length > 0 || (before + after).length > 0)) {
+          invisibleElements.push({
+            text,
+            opacity,
+            color,
+            bg,
+          });
+        }
+
+        if (el.attributes) {
+          for (var j = 0; j < el.attributes.length; j++) {
+            var attr = el.attributes[j];
+            if (!attr) continue;
+            var attrName = attr.name || "";
+            var low = attrName.toLowerCase();
+            if (
+              attrName &&
+              (low === "title" || low === "alt" || low === "aria-label" || low === "placeholder" || low === "value" || low.indexOf("data-") === 0)
+            ) {
+              var attrValue = String(attr.value || "");
+              var attrCodes = extract(attrValue);
+              for (var c = 0; c < attrCodes.length; c += 1) {
+                dataAttrCodes.push({
+                  tag: (el.tagName || "").toLowerCase(),
+                  attr: attrName,
+                  value: attrValue.slice(0, 200),
+                });
+              }
+            }
+          }
+        }
+      }
+
+      var styleTags = Array.from(document.querySelectorAll("style"));
+      for (var s = 0; s < styleTags.length; s++) {
+        var t = styleTags[s];
+        if (!t) continue;
+        var css = t.textContent || "";
+        var cssCodes = extract(css);
+        for (var cs = 0; cs < cssCodes.length; cs += 1) {
+          pushUnique(cssContentCodes, cssCodes[cs]);
+        }
+      }
+
+      try {
+        var windowKeys = Object.keys(window);
+        for (var k = 0; k < Math.min(300, windowKeys.length); k += 1) {
+          var prop = windowKeys[k];
+          if (!prop) continue;
+          try {
+            var windowValue = (window as any)[prop] as unknown;
+            if (typeof windowValue === "string") {
+              var direct = extract(windowValue);
+              for (var x = 0; x < direct.length; x += 1) {
+                pushUnique(jsVariableCodes, direct[x]);
+              }
+              continue;
+            }
+            if (!windowValue || typeof windowValue !== "object") continue;
+            var objectValue = windowValue as Record<string, unknown>;
+            for (var key in objectValue) {
+              if (!Object.prototype.hasOwnProperty.call(objectValue, key)) continue;
+              var nestedValue = objectValue[key];
+              if (typeof nestedValue !== "string") continue;
+              var nested = extract(String(nestedValue));
+              for (var z = 0; z < nested.length; z += 1) {
+                pushUnique(jsVariableCodes, nested[z]);
+              }
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+
+      var bodyText = (document.body ? (document.body.innerText || "") : "");
+
+      return {
+        totalElements: elements.length,
+        textNodesWithMixedAlphanumeric,
+        cssContentCodes,
+        invisibleElements,
+        dataAttrCodes,
+        bodyTextSnippet: bodyText.slice(0, 500),
+        pseudoElementCodes,
+        jsVariableCodes,
+      };
+    }) as ForensicResult;
+
+    return {
+      totalElements: result.totalElements || 0,
+      textNodesWithMixedAlphanumeric: result.textNodesWithMixedAlphanumeric || [],
+      cssContentCodes: result.cssContentCodes || [],
+      invisibleElements: result.invisibleElements || [],
+      dataAttrCodes: result.dataAttrCodes || [],
+      bodyTextSnippet: result.bodyTextSnippet || "",
+      pseudoElementCodes: result.pseudoElementCodes || [],
+      jsVariableCodes: result.jsVariableCodes || [],
+    };
+  } catch (error) {
+    console.log("[FORENSICS_ERROR]", error);
+    return {
+      totalElements: 0,
+      textNodesWithMixedAlphanumeric: [],
+      cssContentCodes: [],
+      invisibleElements: [],
+      dataAttrCodes: [],
+      bodyTextSnippet: "",
+      pseudoElementCodes: [],
+      jsVariableCodes: [],
+    };
+  }
+}
+
+async function strategyClickReveal(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
+  const revealLocator = page.locator(
+    'button:has-text("Reveal Code"), [role="button"]:has-text("Reveal Code"), input[type="button"][value*="Reveal Code" i], input[type="submit"][value*="Reveal Code" i]'
+  );
+
+  const revealCount = await revealLocator.count().catch(() => 0);
+  if (revealCount === 0) {
+    return { success: false };
+  }
+
+  await revealLocator.first().click({ timeout: 1000 }).catch(() => undefined);
+  await waitForStability(page, 1000);
+
+  const hidden = await extractHiddenCodesFromDOM(page).catch(() => ({
+    candidates: [],
+    scanned: 0,
+    rawMatches: 0,
+    filteredMatches: 0,
+  }));
+  const scanCode = hidden.candidates.find((c) => !triedCodes.has(c.code));
+  if (scanCode) {
+    console.log(`  [STRATEGY:click_reveal] clicked Reveal Code, found code: ${scanCode.code}`);
+    return { success: true, code: scanCode.code, codeSource: "reveal_click" };
+  }
+
+  const direct = await page.evaluate(() => {
+    var re = /^[A-Za-z0-9]{6}$/i;
+    var out = [];
+    var nodes = Array.from(document.querySelectorAll("*"));
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i] as Element;
+      if (!el || !el.textContent) continue;
+      var text = (el.textContent || "").trim();
+      if (text.length === 6 && re.test(text)) {
+        out.push(text);
+      }
+    }
+    return out;
+  }).catch(() => []) as string[];
+  const directFresh = pickFreshCodeFromCandidates(direct, triedCodes);
+
+  if (directFresh) {
+    console.log(`  [STRATEGY:click_reveal] clicked Reveal Code, found code: ${directFresh}`);
+    return { success: true, code: directFresh, codeSource: "reveal_click" };
+  }
+
+  console.log(`  [STRATEGY:click_reveal] clicked Reveal Code, no code found`);
+  return { success: false };
+}
+
+async function strategyHiddenDOM(page: Page, triedCodes: Set<string>, preferredMethod?: string | null): Promise<StrategyResult> {
+  const scan = await extractHiddenCodesFromDOM(page).catch(() => ({
+    candidates: [],
+    scanned: 0,
+    rawMatches: 0,
+    filteredMatches: 0,
+  }));
+  const forensics = await deepForensicScan(page);
+
+  const sourceRank = [
+    preferredMethod || "",
+    "dom_scan",
+    "css_pseudo",
+    "invisible_text",
+    "data_attr",
+    "css_content",
+    "js_variable",
+  ];
+
+  const codePool: Array<{ code: string; source: string }> = [];
+
+  for (const c of scan.candidates) {
+    if (!triedCodes.has(c.code) && isAllowedCode(c.code)) {
+      codePool.push({ code: c.code, source: "dom_scan" });
+    }
+  }
+
+  for (const code of forensics.pseudoElementCodes || []) {
+    if (!triedCodes.has(code)) {
+      codePool.push({ code, source: "css_pseudo" });
+    }
+  }
+  for (const row of forensics.invisibleElements) {
+    const values = (row.text || "").match(/[A-Za-z0-9]{6}/g) || [];
+    for (const code of values) {
+      const normalized = normalizeCode(code);
+      if (!isAllowedCode(normalized) || triedCodes.has(normalized)) continue;
+      codePool.push({ code: normalized, source: "invisible_text" });
+    }
+  }
+  for (const row of forensics.dataAttrCodes) {
+    const values = (row.value || "").match(/[A-Za-z0-9]{6}/g) || [];
+    for (const code of values) {
+      const normalized = normalizeCode(code);
+      if (!isAllowedCode(normalized) || triedCodes.has(normalized)) continue;
+      codePool.push({ code: normalized, source: "data_attr" });
+    }
+  }
+  for (const code of forensics.cssContentCodes) {
+    if (isAllowedCode(code) && !triedCodes.has(normalizeCode(code))) {
+      codePool.push({ code: normalizeCode(code), source: "css_content" });
+    }
+  }
+  for (const code of forensics.jsVariableCodes || []) {
+    if (isAllowedCode(code) && !triedCodes.has(normalizeCode(code))) {
+      codePool.push({ code: normalizeCode(code), source: "js_variable" });
+    }
+  }
+
+  const ordered: { code: string; source: string }[] = [];
+  for (const source of sourceRank) {
+    if (!source) continue;
+    for (const item of codePool) {
+      if (item.source !== source) continue;
+      if (!ordered.some((o) => o.code === item.code)) ordered.push(item);
+    }
+  }
+  for (const item of codePool) {
+    if (!ordered.some((o) => o.code === item.code)) ordered.push(item);
+  }
+  const found = ordered.find((item) => isAllowedCode(item.code) && !triedCodes.has(item.code));
+  const foundCodes = ordered.map((entry) => `${entry.code}[${entry.source}]`);
+  console.log(`[STRATEGY:hidden_dom] deep scan: ${forensics.totalElements} els, CSS pseudo: ${(forensics.pseudoElementCodes || []).length}, invisible: ${forensics.invisibleElements.length}, attrs: ${forensics.dataAttrCodes.length}, found: ${foundCodes.slice(0, 8).join(", ") || "none"}`);
+  if (found) {
+    return { success: true, code: found.code, codeSource: found.source === "data_attr" ? "dom_scan" : found.source };
+  }
+
+  return { success: false, forensics };
+}
+
+function isFillerText(text: string): boolean {
+  var normalized = (text || "").toLowerCase().trim();
+  if (!normalized) return false;
+  for (const filler of FILLER_NAV_BUTTON_TEXT) {
+    if (normalized === filler.toLowerCase()) return true;
+  }
+  return false;
+}
+
+async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
+  await page.evaluate(() => {
+    window.scrollTo(0, document.body.scrollHeight);
+  }).catch(() => undefined);
+  await waitForStability(page, 500);
+
+  const button = await page.evaluate(() => {
+    var nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a'));
+    function textOf(el: Element) {
+      var anyEl = el as HTMLElement;
+      return ((anyEl.innerText || anyEl.textContent || (anyEl as any).value || "").trim());
+    }
+    function isVisible(el: Element) {
+      var s = window.getComputedStyle(el);
+      return s.display !== "none" && s.visibility !== "hidden";
+    }
+    var chosen = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i] as Element;
+      var text = textOf(el);
+      if (!text) continue;
+      if (!/(next|continue|navigate)/i.test(text)) continue;
+      if (/^(proceed forward|keep going|next section|continue journey|move on|go forward|next page|proceed)$/i.test(text.trim())) continue;
+      if (!el.getAttribute("data-agent-eid")) continue;
+      if (el.getAttribute("data-agent-eid") === "") continue;
+      if (el.getAttribute("data-agent-eid")) {
+        chosen = { eid: el.getAttribute("data-agent-eid"), text: text };
+        break;
+      }
+    }
+    return chosen;
+  }).catch(() => null);
+
+  if (!button) {
+    return { success: false };
+  }
+
+  try {
+    await page.locator(`[data-agent-eid="${button.eid}"]`).click({ timeout: 900 });
+  } catch {
+    await page
+      .evaluate(`(function(eid){ var el = document.querySelector('[data-agent-eid="${button.eid}"]'); if (!el) return false; try { el.click(); return true; } catch { return false; } })("${button.eid}")`)
+      .catch(() => false);
+  }
+  await waitForStability(page, 500);
+
+  const hidden = await extractHiddenCodesFromDOM(page).catch(() => ({
+    candidates: [],
+    scanned: 0,
+    rawMatches: 0,
+    filteredMatches: 0,
+  }));
+  const target = hidden.candidates.find((entry) => !triedCodes.has(entry.code));
+  if (target) {
+    console.log(`  [STRATEGY:scroll_nav] clicked ${button.text}, found code: ${target.code}`);
+    return { success: true, code: target.code, codeSource: "dom_scan" };
+  }
+  return { success: false };
+}
+
+async function executeStrategy(
+  variant: VariantType,
+  page: Page,
+  snap: DOMSnapshot,
+  triedCodes: Set<string>,
+  preferredSource?: string | null
+): Promise<StrategyResult> {
+  if (variant === "click_reveal") {
+    return strategyClickReveal(page, triedCodes);
+  }
+  if (variant === "hidden_dom") {
+    return strategyHiddenDOM(page, triedCodes, preferredSource);
+  }
+  if (variant === "delayed_reveal") {
+    return strategyHiddenDOM(page, triedCodes, preferredSource);
+  }
+  if (variant === "radio_checkbox") {
+    return {
+      success: false,
+      fallbackToGemini: true,
+    };
+  }
+  if (variant === "scroll_nav") {
+    return strategyScrollNav(page, triedCodes);
+  }
+  return { success: false, fallbackToGemini: false };
 }
 
 async function detectTrap(page: Page): Promise<boolean> {
@@ -796,14 +1432,14 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
       return { eid: el.getAttribute("data-agent-eid") || "", inDialog: inDialog };
     });
 
-  var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 800);
+  var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 1000);
   var hasCodeVisible = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/.test(bodyText);
   var hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
   var hasClickHereText = /(click here|click\\s+\\d+\\s+times)/i.test(bodyText);
 
   return {
     url: window.location.href,
-    stepHintText: truncate(bodyText, 200),
+    stepHintText: bodyText,
     activeDialogEid: activeDialogEid,
     dialogs: dialogs,
     inputs: inputs,
@@ -834,7 +1470,7 @@ async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
   return {
     ...snapshot,
     codesFound: codeList,
-    stepHintText: clampText(snapshot.stepHintText, 200),
+    stepHintText: clampText(snapshot.stepHintText, 1000),
     dialogs: snapshot.dialogs.map((d: any) => ({
       ...d,
       textExcerpt: clampText(d.textExcerpt, 300),
@@ -1237,16 +1873,28 @@ async function submitCodeSafe(page: Page, code: string, deadline: number): Promi
   const snap = await captureDOMSnapshot(page);
   await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
   await submitCodeWithSnapshot(page, snap, code);
+  await waitForStability(page, 800);
 }
 
-async function verifyStep(page: Page, expectedStep: number): Promise<VerifyResult> {
+async function verifyStep(
+  page: Page,
+  expectedStep: number,
+  options?: { previousStepText?: string; previousUrl?: string }
+): Promise<VerifyResult> {
   const bodyText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
   const match = bodyText.match(/Step\s+(\d+)\s+of\s+30/i);
   const current_step = match ? Number(match[1]) : expectedStep;
+  const currentUrl = page.url();
+  const previousText = options?.previousStepText || "";
+  const previousStepMatch = previousText.match(/Step\s+(\d+)\s+of\s+30/i);
+  const previousStep = previousStepMatch ? Number(previousStepMatch[1]) : expectedStep;
   const completed = /(congratulations|completed|well done)/i.test(bodyText);
+  const advancedByText = new RegExp(`Step\\s+${expectedStep + 1}\\s+of\\s+30`, "i").test(bodyText);
+  const advancedByPrevious = previousStepMatch ? current_step > previousStep : false;
+  const urlAdvanced = Boolean(options?.previousUrl && options.previousUrl !== currentUrl);
   return {
     current_step,
-    advanced: current_step > expectedStep || completed,
+    advanced: current_step > expectedStep || completed || advancedByText || advancedByPrevious || urlAdvanced,
     error_message: "",
     completed,
   };
@@ -1798,7 +2446,9 @@ function buildVisionPrompt(
   turn: number,
   state: VisionSkillPlanState,
   candidates: CandidateForClick[],
-  failedCodes: string[]
+  failedCodes: string[],
+  variant?: VariantType,
+  preferredSource?: string | null
 ): string {
   const payload = {
     mission: "Pick exactly one safe skill for this turn.",
@@ -1817,8 +2467,15 @@ function buildVisionPrompt(
   const failedLine = failedCodes.length > 0
     ? `\n\nPreviously failed codes (do NOT re-submit these): ${failedCodes.join(", ")}`
     : "\n\nPreviously failed codes (do NOT re-submit these): none";
+  const variantLine = variant ? `\n\nCurrent step variant: ${variant}` : "";
+  const learningLine = variant && preferredSource
+    ? `\n\nBased on prior runs, ${variant} steps have been solved by ${preferredSource}. Try that approach.`
+    : "";
+  const radioLine = variant === "radio_checkbox"
+    ? "\n\nThis is a radio/checkbox selection step. Focus on reading the options and selecting the correct one."
+    : "";
 
-  return `${VISION_SKILL_PROMPT}\n\n${VISION_SKILL_FEW_SHOT_EXAMPLES}${failedLine}\n\nSTATE_JSON:\n${JSON.stringify(payload)}`;
+  return `${VISION_SKILL_PROMPT}\n\n${VISION_SKILL_FEW_SHOT_EXAMPLES}${failedLine}${variantLine}${learningLine}${radioLine}\n\nSTATE_JSON:\n${JSON.stringify(payload)}`;
 }
 
 function sanitizeVisionDecision(
@@ -1897,7 +2554,9 @@ async function chooseVisionSkill(
   state: VisionSkillPlanState,
   triedCodes: Set<string>,
   forceNonSubmit?: boolean,
-  consecutiveScrollFails?: number
+  consecutiveScrollFails?: number,
+  variant?: VariantType,
+  preferredSource?: string | null
 ): Promise<VisionSkillDecision> {
   const candidates = buildTopCandidates(snap);
   if (state.stuck) {
@@ -1917,7 +2576,9 @@ async function chooseVisionSkill(
       turn,
       state,
       candidates,
-      failedCodes
+      failedCodes,
+      variant,
+      preferredSource
     );
     const img = await captureVisionScreenshot(
       page,
@@ -2139,37 +2800,57 @@ async function solveStep(
   let explorePass = 0;
   let forceNonSubmit = false;
   let consecutiveScrollFails = 0;
+  let turnsUsed = 0;
   stateRepeatLog.clear();
 
-  const preLoopScan = await extractHiddenCodesFromDOM(page).catch(() => ({
-    candidates: [],
-    scanned: 0,
-    rawMatches: 0,
-    filteredMatches: 0,
-  }));
-  console.log(`[DOM_SCAN] scanned ${preLoopScan.scanned} elements, found ${preLoopScan.rawMatches} raw matches, ${preLoopScan.filteredMatches} after filtering`);
-  const freshHiddenCode = preLoopScan.candidates.find((candidate) => !triedCodes.has(candidate.code));
-  if (freshHiddenCode) {
-    const normalizedCode = normalizeCode(freshHiddenCode.code);
-    const classes = freshHiddenCode.className
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((chunk) => chunk.trim())
-      .filter(Boolean)
-      .join(".");
-    const tagRef = classes ? `${freshHiddenCode.tagName}.${classes}` : freshHiddenCode.tagName;
-    console.log(`  [DOM_HIDDEN_CODE] found code ${normalizedCode} in hidden element ${tagRef}`);
+  const learningEntries = await readLearningFile();
+  const initialSnap = await captureDOMSnapshot(page);
+  const variant = detectVariant(initialSnap);
+  const preferredSource = getPreferredCodeSource(learningEntries, variant);
+  const strategyUsed = variant === "unknown" ? "vision_skill_loop" : `strategy:${variant}`;
+  let attemptForensics: any = null;
 
-    await submitCodeSafe(page, normalizedCode, deadline);
-    const verify = await verifyStep(page, stepNumber);
-    if (verify.advanced || verify.completed) return { success: true };
-    triedCodes.add(normalizedCode);
-    globalFailedCodes.add(normalizedCode);
-    console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
-    await waitForStability(page, 100);
+  const strategyResult = await executeStrategy(variant, page, initialSnap, triedCodes, preferredSource);
+  if (strategyResult.forensics) {
+    attemptForensics = strategyResult.forensics;
+  }
+
+  if (strategyResult.success && strategyResult.code) {
+    const normalizedCode = normalizeCode(strategyResult.code);
+    if (!triedCodes.has(normalizedCode)) {
+      console.log(`[STRATEGY_WIN] ${variant} strategy found code ${normalizedCode}, submitting`);
+      const beforeUrl = page.url();
+      const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
+      await submitCodeSafe(page, normalizedCode, deadline);
+      const verify = await verifyStep(page, stepNumber, {
+        previousUrl: beforeUrl,
+        previousStepText: beforeText,
+      });
+      if (verify.advanced || verify.completed) {
+        await appendToLearningFile(stepNumber, variant, {
+          strategyUsed,
+          success: true,
+          codeFound: normalizedCode,
+          codeSource: strategyResult.codeSource ?? "strategy",
+          attemptsUsed: attempt,
+        });
+        return { success: true };
+      }
+      triedCodes.add(normalizedCode);
+      globalFailedCodes.add(normalizedCode);
+      console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
+      await waitForStability(page, 100);
+    } else {
+      console.log(`  [STRATEGY_SKIP] code ${normalizedCode} already tried`);
+    }
+  }
+
+  if (strategyResult.fallbackToGemini) {
+    console.log(`[STRATEGY_FALLBACK] ${variant} requires vision-based Gemini handling`);
   }
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
+    turnsUsed = turn;
     await restoreOverlayShields(page);
     await injectEIDs(page);
     await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
@@ -2177,6 +2858,13 @@ async function solveStep(
     const snap = await captureDOMSnapshot(page);
     const verifyBefore = await verifyStep(page, stepNumber);
     if (verifyBefore.advanced || verifyBefore.completed) {
+      await appendToLearningFile(stepNumber, variant, {
+        strategyUsed,
+        success: true,
+        codeFound: null,
+        codeSource: "vision",
+        attemptsUsed: attempt,
+      });
       return { success: true };
     }
 
@@ -2193,9 +2881,23 @@ async function solveStep(
       if (freshVisibleCode) {
         const normalizedCode = normalizeCode(freshVisibleCode.code);
         console.log(`  [VISIBLE_CODE_EXTRACT] found fresh code ${normalizedCode}, submitting directly`);
+        const beforeUrl = page.url();
+        const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
         await submitCodeSafe(page, normalizedCode, deadline);
-        const visibleVerify = await verifyStep(page, stepNumber);
-        if (visibleVerify.advanced || visibleVerify.completed) return { success: true };
+        const visibleVerify = await verifyStep(page, stepNumber, {
+          previousUrl: beforeUrl,
+          previousStepText: beforeText,
+        });
+        if (visibleVerify.advanced || visibleVerify.completed) {
+          await appendToLearningFile(stepNumber, variant, {
+            strategyUsed,
+            success: true,
+            codeFound: normalizedCode,
+            codeSource: "dom_scan",
+            attemptsUsed: attempt,
+          });
+          return { success: true };
+        }
         triedCodes.add(normalizedCode);
         globalFailedCodes.add(normalizedCode);
         console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
@@ -2205,16 +2907,30 @@ async function solveStep(
     }
 
     const immediateCode = await checkForCode(page, triedCodes);
-    if (immediateCode) {
+      if (immediateCode) {
       const normalizedCode = normalizeCode(immediateCode);
       console.log(`  [VISION_FASTPATH] code found before decision: ${normalizedCode}`);
       if (triedCodes.has(normalizedCode)) {
         console.log(`  [FASTPATH_SKIP] code ${normalizedCode} already tried`);
         forceNonSubmit = true;
       } else {
+        const beforeUrl = page.url();
+        const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
         await submitCodeSafe(page, normalizedCode, deadline);
-        const verify = await verifyStep(page, stepNumber);
-        if (verify.advanced || verify.completed) return { success: true };
+        const verify = await verifyStep(page, stepNumber, {
+          previousUrl: beforeUrl,
+          previousStepText: beforeText,
+        });
+        if (verify.advanced || verify.completed) {
+          await appendToLearningFile(stepNumber, variant, {
+            strategyUsed,
+            success: true,
+            codeFound: normalizedCode,
+            codeSource: "dom_scan",
+            attemptsUsed: attempt,
+          });
+          return { success: true };
+        }
         triedCodes.add(normalizedCode);
         globalFailedCodes.add(normalizedCode);
         console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
@@ -2242,7 +2958,9 @@ async function solveStep(
       state,
       triedCodes,
       forceNonSubmit,
-      consecutiveScrollFails
+      consecutiveScrollFails,
+      variant,
+      preferredSource
     );
     forceNonSubmit = false;
 
@@ -2286,9 +3004,23 @@ async function solveStep(
       }
 
       console.log(`  [VISION_CODE] submitting returned code ${normalizedCode}`);
+      const beforeUrl = page.url();
+      const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
       await submitCodeSafe(page, normalizedCode, deadline);
-      const verify = await verifyStep(page, stepNumber);
-      if (verify.advanced || verify.completed) return { success: true };
+      const verify = await verifyStep(page, stepNumber, {
+        previousUrl: beforeUrl,
+        previousStepText: beforeText,
+      });
+      if (verify.advanced || verify.completed) {
+        await appendToLearningFile(stepNumber, variant, {
+          strategyUsed,
+          success: true,
+          codeFound: normalizedCode,
+          codeSource: "submit_code",
+          attemptsUsed: attempt,
+        });
+        return { success: true };
+      }
       triedCodes.add(normalizedCode);
       globalFailedCodes.add(normalizedCode);
       console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
@@ -2307,6 +3039,13 @@ async function solveStep(
 
     const verifyAfter = await verifyStep(page, stepNumber);
     if (verifyAfter.advanced || verifyAfter.completed) {
+      await appendToLearningFile(stepNumber, variant, {
+        strategyUsed,
+        success: true,
+        codeFound: null,
+        codeSource: "gemini",
+        attemptsUsed: attempt,
+      });
       return { success: true };
     }
 
@@ -2321,7 +3060,21 @@ async function solveStep(
     }
   }
 
-  return { success: false, error: "Step deadline exceeded" };
+  const forensics = await deepForensicScan(page);
+  console.log(`[AUTO_FORENSICS] step=${stepNumber} attempt=${attempt}`, JSON.stringify(forensics));
+  await appendToLearningFile(stepNumber, variant, {
+    strategyUsed,
+    success: false,
+    codeFound: null,
+    codeSource: null,
+    attemptsUsed: attempt,
+    forensics: attemptForensics ?? forensics,
+  });
+
+  return {
+    success: false,
+    error: `Step deadline exceeded after ${turnsUsed}/${MAX_VISION_SKILL_TURNS} turns`,
+  };
 }
 
 export async function runStartPhase(page: Page, config: AgentConfig): Promise<void> {
@@ -2417,3 +3170,4 @@ export async function runAgent(page: Page, config: AgentConfig): Promise<StepRes
   console.log(`[SKILL_LOGS_JSON] ${JSON.stringify(skillLogs)}`);
   return results;
 }
+
