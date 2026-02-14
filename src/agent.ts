@@ -454,7 +454,7 @@ const FILLER_NAV_BUTTON_TEXT = [
 const VARIANT_HINT_PATTERNS = {
   clickReveal: /click to reveal|click the button below to reveal|reveal code/i,
   hiddenDom: /hidden dom|hidden in the dom|hidden code/i,
-  scrollReveal: /scroll to reveal|scroll down.*to reveal/i,
+  scrollReveal: /scroll to reveal|scroll down.*reveal|scroll down.*at least|scroll.*reveal/i,
   scrollNav: /scroll down to find|scroll to find|keep scrolling/i,
   delayedReveal: /delayed reveal|will appear after waiting|wait for the code/i,
 };
@@ -1004,10 +1004,16 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
 
 type ForensicCandidate = { code: string; source: string };
 
-function collectForensicCodeCandidates(forensics: ForensicResult): ForensicCandidate[] {
+function collectForensicCodeCandidates(
+  forensics: ForensicResult,
+  variant: VariantType = "unknown"
+): ForensicCandidate[] {
   const candidates: ForensicCandidate[] = [];
   const seen: Record<string, true> = {};
   const regex = /[A-Za-z0-9]{6}/g;
+  const includeJsVariables = variant !== "scroll_reveal" && variant !== "click_reveal";
+  const jsLimit = 3;
+  const jsAdded: ForensicCandidate[] = [];
 
   const add = (raw: string, source: string) => {
     const normalized = normalizeCode(raw);
@@ -1016,10 +1022,6 @@ function collectForensicCodeCandidates(forensics: ForensicResult): ForensicCandi
     seen[normalized] = true;
     candidates.push({ code: normalized, source });
   };
-
-  for (const code of forensics.jsVariableCodes || []) {
-    add(code, "js_variable");
-  }
 
   for (const code of forensics.cssContentCodes || []) {
     add(code, "css_content");
@@ -1042,6 +1044,21 @@ function collectForensicCodeCandidates(forensics: ForensicResult): ForensicCandi
 
   for (const code of forensics.pseudoElementCodes || []) {
     add(code, "css_pseudo");
+  }
+
+  if (includeJsVariables) {
+    for (const code of forensics.jsVariableCodes || []) {
+      const normalized = normalizeCode(code);
+      if (!isAllowedCode(normalized)) continue;
+      if (seen[normalized]) continue;
+      if (jsAdded.length >= jsLimit) continue;
+      seen[normalized] = true;
+      jsAdded.push({ code: normalized, source: "js_variable" });
+    }
+  }
+
+  for (const entry of jsAdded) {
+    candidates.push(entry);
   }
 
   return candidates;
@@ -1701,20 +1718,40 @@ async function restoreOverlayShields(page: Page): Promise<void> {
       var node = shielded[i];
       if (!(node instanceof HTMLElement)) continue;
       var previousVisibility = node.getAttribute("data-overlay-shield-old-visibility");
+      var previousPointerEvents = node.getAttribute("data-overlay-shield-old-pointer-events");
+      var previousOpacity = node.getAttribute("data-overlay-shield-old-opacity");
+      var previousZIndex = node.getAttribute("data-overlay-shield-old-z-index");
       if (previousVisibility && previousVisibility.length > 0) {
         node.style.visibility = previousVisibility;
       } else {
         node.style.removeProperty("visibility");
       }
+      if (previousPointerEvents && previousPointerEvents.length > 0) {
+        node.style.pointerEvents = previousPointerEvents;
+      } else {
+        node.style.removeProperty("pointer-events");
+      }
+      if (previousOpacity && previousOpacity.length > 0) {
+        node.style.opacity = previousOpacity;
+      } else {
+        node.style.removeProperty("opacity");
+      }
+      if (previousZIndex && previousZIndex.length > 0) {
+        node.style.zIndex = previousZIndex;
+      } else {
+        node.style.removeProperty("z-index");
+      }
       node.removeAttribute("data-overlay-shield");
       node.removeAttribute("data-overlay-shield-old-visibility");
       node.removeAttribute("data-overlay-shield-old-pointer-events");
+      node.removeAttribute("data-overlay-shield-old-opacity");
+      node.removeAttribute("data-overlay-shield-old-z-index");
     }
   })()`).catch(() => undefined);
 }
 
 async function nukeOverlays(page: Page): Promise<number> {
-  return page
+  const result = await page
     .evaluate(`(function() {
       var all = document.querySelectorAll("*");
       var vw = window.innerWidth || 1;
@@ -1729,11 +1766,11 @@ async function nukeOverlays(page: Page): Promise<number> {
         var el = all[i];
         if (!(el instanceof HTMLElement)) continue;
         if (el.closest("body") !== document.body) continue;
+        if (el.dataset && el.dataset.nuked === "true") continue;
 
         var style = window.getComputedStyle(el);
         var position = style.position;
         if (position !== "fixed" && position !== "absolute") continue;
-        if (el.dataset && el.dataset.nuked === "true") continue;
 
         var rect = el.getBoundingClientRect();
         var area = Math.max(0, rect.width) * Math.max(0, rect.height);
@@ -1743,64 +1780,86 @@ async function nukeOverlays(page: Page): Promise<number> {
         var isHighZ = !isNaN(z) && z >= 9990;
         var highZ = !isNaN(z) && z > 100;
         var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
+        var needsHide = false;
 
         if (isHighZ) {
           var forceTag = (el.tagName || "unknown").toLowerCase();
           var forceClasses = (el.className || "").toString().trim().replace(/\\s+/g, ".");
-          var forceLabel = forceClasses
-            ? forceTag + "." + forceClasses + " z-index=" + z
-            : forceTag + " z-index=" + z;
-          skipped.push("FORCE:" + forceLabel);
-          var currentForce = el.style.display || "";
-          if (currentForce !== "none") {
-            el.style.display = "none";
-            el.dataset.nuked = "true";
-            nuked += 1;
-          }
-          continue;
-        }
-
-        if (big || decoy) {
+          var forceLabel = forceClasses ? forceTag + "." + forceClasses : forceTag;
+          skipped.push("FORCE:" + forceLabel + " z-index=" + z);
+          needsHide = true;
+        } else if (big || decoy) {
           if (codePattern.test(text)) {
             var tag = (el.tagName || "unknown").toLowerCase();
             var classes = (el.className || "").toString().trim().replace(/\\s+/g, ".");
             skipped.push(classes ? tag + "." + classes : tag);
-            continue;
-          }
-          var current = el.style.display || "";
-          if (current !== "none") {
-            el.style.display = "none";
-            el.dataset.nuked = "true";
-            nuked += 1;
+          } else {
+            needsHide = true;
           }
         }
+
+        if (!needsHide) continue;
+
+        var currentDisplay = el.style.display || "";
+        var currentVisibility = el.style.visibility || "";
+        var currentPointer = el.style.pointerEvents || "";
+        var currentOpacity = el.style.opacity || "";
+        var currentZIndex = el.style.zIndex || "";
+
+        el.style.display = "none";
+        el.style.visibility = "hidden";
+        el.style.pointerEvents = "none";
+        el.style.opacity = "0";
+        el.style.zIndex = "-1";
+
+        if (el.dataset) {
+          el.dataset.nuked = "true";
+          el.dataset.nukeOldDisplay = currentDisplay;
+          el.dataset.nukeOldVisibility = currentVisibility;
+          el.dataset.nukeOldPointerEvents = currentPointer;
+          el.dataset.nukeOldOpacity = currentOpacity;
+          el.dataset.nukeOldZIndex = currentZIndex;
+        }
+
+        nuked += 1;
       }
 
       return { nuked: nuked, skipped: skipped };
     })()`)
-    .then((result) => {
-      const typed = result as { nuked: number; skipped: string[] } | null;
-      if (typed && typed.skipped && typed.skipped.length > 0) {
-        var preserve = [];
-        var forced = [];
-        for (var i = 0; i < typed.skipped.length; i++) {
-          var value = typed.skipped[i];
-          if (value.indexOf("FORCE:") === 0) {
-            forced.push(value.replace("FORCE:", ""));
-          } else {
-            preserve.push(value);
-          }
-        }
-        if (forced.length > 0) {
-          console.log(`[NUKE_FORCE] removing high-z overlay: ${forced.join(", ")}`);
-        }
-        if (preserve.length > 0) {
-          console.log(`[NUKE_SKIP] preserving potential code elements: ${preserve.join(", ")}`);
-        }
+    .catch(() => null);
+
+  const typed = (result as { nuked: number; skipped: string[] } | null) || { nuked: 0, skipped: [] };
+  if (typed.skipped.length > 0) {
+    var preserve = [];
+    var forced = [];
+    for (var i = 0; i < typed.skipped.length; i++) {
+      var value = typed.skipped[i];
+      if (value.indexOf("FORCE:") === 0) {
+        forced.push(value.replace("FORCE:", ""));
+      } else {
+        preserve.push(value);
       }
-      return typed?.nuked ?? 0;
-    })
-    .catch(() => 0);
+    }
+    if (forced.length > 0) {
+      console.log(`[NUKE_HIDE] hiding high-z overlay: ${forced.join(", ")}`);
+    }
+    if (preserve.length > 0) {
+      console.log(`[NUKE_SKIP] preserving potential code elements: ${preserve.join(", ")}`);
+    }
+  }
+
+  const hasInput = await page
+    .evaluate(`(function() {
+      return !!document.querySelector("input");
+    })()`)
+    .catch(() => true);
+  if (!hasInput) {
+    console.log("[NUKE_DAMAGE] form destroyed by overlay removal  reloading page");
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+    await waitForStability(page, 2000);
+  }
+
+  return typed.nuked;
 }
 
 async function dismissOverlays(page: Page, deadline: number): Promise<void> {
@@ -2020,7 +2079,12 @@ async function clearSubmitObstructions(page: Page, submitEid?: string | null): P
         if (el === submitButton) continue;
         if (formRoot && formRoot.contains(el)) continue;
         if (hasSubmitControl(el)) continue;
-        try { el.remove(); } catch (e) {}
+        try {
+          el.style.display = "none";
+          el.style.pointerEvents = "none";
+          el.style.visibility = "hidden";
+          el.style.opacity = "0";
+        } catch (e) {}
       }
     }
 
@@ -3101,11 +3165,11 @@ async function solveStep(
   const strategyUsed = variant === "unknown" ? "vision_skill_loop" : `strategy:${variant}`;
   let attemptForensics: any = null;
 
-  const runForensicFallback = async (): Promise<boolean> => {
-    const forensics = await deepForensicScan(page).catch(() => null);
-    if (!forensics) return false;
-    attemptForensics = forensics;
-    const candidates = collectForensicCodeCandidates(forensics);
+  const runForensicFallback = async (forensics?: ForensicResult): Promise<boolean> => {
+    const scan = forensics ?? (await deepForensicScan(page).catch(() => null));
+    if (!scan) return false;
+    attemptForensics = scan;
+    const candidates = collectForensicCodeCandidates(scan, variant);
     return await tryForensicCodesFirst(
       page,
       candidates,
@@ -3117,10 +3181,6 @@ async function solveStep(
       attempt
     );
   };
-
-  if (await runForensicFallback()) {
-    return { success: true };
-  }
 
   const hintCode = extractCodesFromHint(initialSnap.stepHintText, triedCodes);
   if (hintCode) {
@@ -3146,6 +3206,7 @@ async function solveStep(
   if (strategyResult.forensics) {
     attemptForensics = strategyResult.forensics;
   }
+  const strategyForensics = strategyResult.forensics;
 
   if (strategyResult.success && strategyResult.code) {
     const normalizedCode = normalizeCode(strategyResult.code);
@@ -3166,7 +3227,10 @@ async function solveStep(
       globalFailedCodes.add(normalizedCode);
       console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
       await waitForStability(page, 100);
-      if (await runForensicFallback()) {
+      if (strategyResult.codeSource) {
+        console.log(`[STRATEGY_RETRY] strategy-submitted code failed, falling back to forensic scan`);
+      }
+      if (await runForensicFallback(strategyForensics)) {
         return { success: true };
       }
     } else {
@@ -3176,6 +3240,10 @@ async function solveStep(
 
   if (strategyResult.fallbackToGemini) {
     console.log(`[STRATEGY_FALLBACK] ${variant} requires vision-based Gemini handling`);
+  }
+
+  if (await runForensicFallback(strategyForensics)) {
+    return { success: true };
   }
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
