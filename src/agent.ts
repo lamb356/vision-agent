@@ -340,7 +340,7 @@ const CODE_CONTEXT_HINTS = /\\b(code|enter|submit|verification|verify|access|pas
 const CSS_UNIT_SUFFIX_RE = /^(?=.*\d)[A-Za-z0-9]+(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
 const UNIT_SUFFIX_ONLY_RE = /^(\d+)(px|ms|pt|em|rem|vh|vw|deg|ch|cm|mm|in|ex|s)$/i;
 
-type VariantType = "click_reveal" | "hidden_dom" | "radio_checkbox" | "scroll_nav" | "delayed_reveal" | "unknown";
+type VariantType = "click_reveal" | "hidden_dom" | "radio_checkbox" | "scroll_nav" | "scroll_reveal" | "delayed_reveal" | "unknown";
 
 interface StrategyResult {
   success: boolean;
@@ -454,6 +454,7 @@ const FILLER_NAV_BUTTON_TEXT = [
 const VARIANT_HINT_PATTERNS = {
   clickReveal: /click to reveal|click the button below to reveal|reveal code/i,
   hiddenDom: /hidden dom|hidden in the dom|hidden code/i,
+  scrollReveal: /scroll to reveal|scroll down.*to reveal/i,
   scrollNav: /scroll down to find|scroll to find|keep scrolling/i,
   delayedReveal: /delayed reveal|will appear after waiting|wait for the code/i,
 };
@@ -545,11 +546,11 @@ async function logDomOnlyCodeSourceOnce(page: Page, code: string): Promise<void>
       var out = [];
       var all = Array.from(document.querySelectorAll("*"));
 
-      function isVisible(el) {
+      var isVisible = function(el) {
         var s = window.getComputedStyle(el);
         var r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
-      }
+      };
 
       for (var i = 0; i < all.length && out.length < 8; i++) {
         var el = all[i];
@@ -608,6 +609,21 @@ async function checkForCode(page: Page, exclude?: Set<string>): Promise<string |
   const domCandidate = pickCode(domCodes, exclude);
   if (domCandidate) {
     await logDomOnlyCodeSourceOnce(page, domCandidate);
+  }
+
+  return null;
+}
+
+function extractCodesFromHint(hint: string, triedCodes: Set<string>): string | null {
+  const text = (hint || "").toUpperCase();
+  const matches = text.match(/[A-Za-z0-9]{6}/g);
+  if (!matches) return null;
+
+  for (const found of matches) {
+    const normalized = normalizeCode(found);
+    if (triedCodes.has(normalized)) continue;
+    if (!isPlausibleCodeCandidate(normalized)) continue;
+    return normalized;
   }
 
   return null;
@@ -743,6 +759,11 @@ function detectVariant(snap: DOMSnapshot): VariantType {
     return "delayed_reveal";
   }
 
+  if (VARIANT_HINT_PATTERNS.scrollReveal.test(hint)) {
+    console.log(`[VARIANT] detected: scroll_reveal from hint: "${hintSnippet}"`);
+    return "scroll_reveal";
+  }
+
   if ((VARIANT_HINT_PATTERNS.hiddenDom.test(hint) && !snap.features.hasCodeVisible)) {
     console.log(`[VARIANT] detected: hidden_dom from hint: "${hintSnippet}"`);
     return "hidden_dom";
@@ -785,21 +806,21 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
       var pseudoElementCodes: string[] = [];
       var jsVariableCodes: string[] = [];
 
-      function visible(el: Element) {
+      var visible = function(el: Element) {
         var s = window.getComputedStyle(el);
         var r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
-      }
+      };
 
-      function isAllowed(code: string) {
+      var isAllowed = function(code: string) {
         if (!/^([A-Z0-9]{6})$/i.test(code)) return false;
         if (!/[A-Z]/i.test(code) || !/[0-9]/.test(code)) return false;
         if (/^#?[0-9a-fA-F]{6}$/.test(code)) return false;
         if (forbidden[code.toLowerCase()]) return false;
         return true;
-      }
+      };
 
-      function extract(text: string): string[] {
+      var extract = function(text: string) {
         var out: string[] = [];
         if (!text) return out;
         var m;
@@ -811,11 +832,11 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
           }
         }
         return out;
-      }
+      };
 
-      function pushUnique(target: string[], code: string) {
+      var pushUnique = function(target: string[], code: string) {
         if (target.indexOf(code) === -1) target.push(code);
-      }
+      };
 
       for (var i = 0; i < elements.length; i++) {
         var el = elements[i] as Element;
@@ -1128,14 +1149,14 @@ async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<S
 
   const button = await page.evaluate(() => {
     var nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a'));
-    function textOf(el: Element) {
+    var textOf = function(el: Element) {
       var anyEl = el as HTMLElement;
       return ((anyEl.innerText || anyEl.textContent || (anyEl as any).value || "").trim());
-    }
-    function isVisible(el: Element) {
+    };
+    var isVisible = function(el: Element) {
       var s = window.getComputedStyle(el);
       return s.display !== "none" && s.visibility !== "hidden";
-    }
+    };
     var chosen = null;
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i] as Element;
@@ -1180,6 +1201,47 @@ async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<S
   return { success: false };
 }
 
+async function strategyScrollReveal(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
+  const directScan = async () => {
+    const hidden = await extractHiddenCodesFromDOM(page).catch(() => ({
+      candidates: [],
+      scanned: 0,
+      rawMatches: 0,
+      filteredMatches: 0,
+    }));
+    const directMatch = hidden.candidates.find((entry) => !triedCodes.has(entry.code));
+    if (directMatch) return directMatch.code;
+
+    const bodyText = (await page.evaluate("document.body ? document.body.innerText : ''").catch(() => "")) as string;
+    const matches = (bodyText || "").match(/[A-Za-z0-9]{6}/g) || [];
+    for (const match of matches) {
+      const normalized = normalizeCode(match);
+      if (triedCodes.has(normalized)) continue;
+      if (!isPlausibleCodeCandidate(normalized)) continue;
+      return normalized;
+    }
+    return null;
+  };
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const px = 600;
+    await page.evaluate("window.scrollBy(0, 600);").catch(() => undefined);
+    await waitForStability(page, 1500);
+
+    const foundCode = await directScan();
+    if (foundCode) {
+      console.log(`  [STRATEGY:scroll_reveal] scrolled ${px}px, found code: ${foundCode}`);
+      return { success: true, code: foundCode, codeSource: "scroll_reveal" };
+    }
+
+    if (await detectTrap(page).catch(() => false)) {
+      await dismissOverlays(page, now() + DISMISS_TIME_CAP_MS);
+    }
+  }
+
+  return { success: false };
+}
+
 async function executeStrategy(
   variant: VariantType,
   page: Page,
@@ -1204,6 +1266,9 @@ async function executeStrategy(
   }
   if (variant === "scroll_nav") {
     return strategyScrollNav(page, triedCodes);
+  }
+  if (variant === "scroll_reveal") {
+    return strategyScrollReveal(page, triedCodes);
   }
   return { success: false, fallbackToGemini: false };
 }
@@ -1286,7 +1351,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
     'a'
   ];
 
-  function isVisible(el) {
+  var isVisible = function(el) {
     var style = window.getComputedStyle(el);
     var rect = el.getBoundingClientRect();
     var vw = window.innerWidth || 0;
@@ -1301,18 +1366,18 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
       style.visibility !== "hidden" &&
       style.opacity !== "0"
     );
-  }
+  };
 
-  function textOf(el) {
+  var textOf = function(el) {
     if (!el) return "";
     return (el.innerText || el.textContent || "").trim();
-  }
+  };
 
-  function truncate(text, maxLen) {
+  var truncate = function(text, maxLen) {
     return text.length > maxLen ? text.slice(0, maxLen) : text;
-  }
+  };
 
-  function isTopmostAtPoint(el) {
+  var isTopmostAtPoint = function(el) {
     if (!el) return false;
     var rect = el.getBoundingClientRect();
     var cx = rect.x + rect.width / 2;
@@ -1320,7 +1385,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
     if (!isFinite(cx) || !isFinite(cy)) return false;
     var top = document.elementFromPoint(cx, cy);
     return top === el || (top && el.contains(top));
-  }
+  };
 
   var dialogElements = Array.from(
     document.querySelectorAll(dialogSelectors.join(","))
@@ -1432,7 +1497,7 @@ const CAPTURE_DOM_SNAPSHOT_SCRIPT = `(function() {
       return { eid: el.getAttribute("data-agent-eid") || "", inDialog: inDialog };
     });
 
-  var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 1000);
+  var bodyText = truncate((document.body ? document.body.innerText : "").trim(), 5000);
   var hasCodeVisible = /\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6}\\b/.test(bodyText);
   var hasRevealText = /(reveal|show|unlock|display)/i.test(bodyText);
   var hasClickHereText = /(click here|click\\s+\\d+\\s+times)/i.test(bodyText);
@@ -1470,7 +1535,7 @@ async function captureDOMSnapshot(page: Page): Promise<DOMSnapshot> {
   return {
     ...snapshot,
     codesFound: codeList,
-    stepHintText: clampText(snapshot.stepHintText, 1000),
+    stepHintText: clampText(snapshot.stepHintText, 5000),
     dialogs: snapshot.dialogs.map((d: any) => ({
       ...d,
       textExcerpt: clampText(d.textExcerpt, 300),
@@ -1735,11 +1800,11 @@ async function selectSubmitButton(
       inputEl = document.querySelector('[data-agent-eid="' + inputEid + '"]');
     }
 
-    function isVis(el) {
+    var isVis = function(el) {
       var s = window.getComputedStyle(el);
       var r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-    }
+    };
 
     // (a) If input is inside a <form>, pick first visible submit in that form
     if (inputEl) {
@@ -1754,14 +1819,14 @@ async function selectSubmitButton(
       }
     }
 
-    function isTopmost(el) {
+    var isTopmost = function(el) {
       var r = el.getBoundingClientRect();
       var cx = r.x + r.width / 2;
       var cy = r.y + r.height / 2;
       if (!isFinite(cx) || !isFinite(cy)) return false;
       var top = document.elementFromPoint(cx, cy);
       return top === el || (top && el.contains(top));
-    }
+    };
 
     // Gather all visible buttons with EIDs
     var allBtns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]'));
@@ -1807,8 +1872,11 @@ function selectInputEid(snap: DOMSnapshot): string | null {
 async function submitCodeWithSnapshot(
   page: Page,
   snap: DOMSnapshot,
-  code: string
-): Promise<void> {
+  code: string,
+  expectedStep: number,
+  previousUrl: string,
+  previousText: string
+): Promise<boolean> {
   const inputEid = selectInputEid(snap);
   console.log(`  [SUBMIT] code="${code}" inputEid=${inputEid ?? "no input EID found"}`);
   if (inputEid) {
@@ -1824,35 +1892,62 @@ async function submitCodeWithSnapshot(
   console.log(`  [SUBMIT] submitEid=${submitEid ?? "no submit EID found"}`);
   if (submitEid) {
     const submitLoc = page.locator(`[data-agent-eid="${submitEid}"]`);
-    try {
-      await submitLoc.click({ timeout: 800 });
-      console.log(`  [SUBMIT] click succeeded`);
-    } catch {
-      console.log(`  [SUBMIT] click failed, dismissing overlays and retrying`);
-      await dismissOverlays(page, now() + DISMISS_TIME_CAP_MS);
-      try {
-        await submitLoc.click({ timeout: 800 });
-        console.log(`  [SUBMIT] retry click succeeded`);
-      } catch {
-        console.log(`  [SUBMIT] retry failed, attempting JS click`);
+    let clickAttempted = false;
 
-        const jsClicked = await page
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await nukeOverlays(page).catch(() => undefined);
+      if (attempt > 1) {
+        console.log(`[SUBMIT_RETRY] attempt ${attempt} after nuking overlays`);
+        await page
           .evaluate(`(function(eid) {
             var el = document.querySelector('[data-agent-eid="' + eid + '"]');
-            if (!el) return false;
-            try { el.click(); return true; } catch (e) { return false; }
+            if (!el) return;
+            if (el.scrollIntoView) {
+              el.scrollIntoView({ block: "center", inline: "center" });
+            }
           })("${submitEid}")`)
-          .catch(() => false);
+          .catch(() => undefined);
+      }
 
-        if (jsClicked) {
-          console.log(`  [SUBMIT] JS click dispatched`);
+      try {
+        await submitLoc.click({ timeout: 800 });
+        console.log(`  [SUBMIT] click succeeded`);
+        clickAttempted = true;
+        break;
+      } catch {
+        if (attempt === 1) {
+          console.log(`  [SUBMIT] click failed, dismissing overlays and retrying`);
+        }
+      }
+      await waitForStability(page, 120);
+    }
+
+    if (!clickAttempted) {
+      console.log(`  [SUBMIT] retry failed, attempting JS click`);
+      const jsClicked = await page
+        .evaluate(`(function(eid) {
+          var el = document.querySelector('[data-agent-eid="' + eid + '"]');
+          if (!el) return false;
+          try { el.click(); return true; } catch (e) { return false; }
+        })("${submitEid}")`)
+        .catch(() => false);
+
+      if (jsClicked) {
+        console.log(`  [SUBMIT] JS click dispatched`);
+        await waitForStability(page, 1000);
+        const jsVerify = await verifyStep(page, expectedStep, {
+          previousUrl,
+          previousStepText: previousText,
+        }).catch(() => ({ advanced: false, completed: false, error_message: "", current_step: expectedStep }));
+        if (jsVerify.advanced || jsVerify.completed) {
+          return true;
+        }
+      } else {
+        console.log(`  [SUBMIT] JS click failed, pressing Enter fallback`);
+        if (inputEid) {
+          await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
         } else {
-          console.log(`  [SUBMIT] JS click failed, pressing Enter fallback`);
-          if (inputEid) {
-            await page.locator(`[data-agent-eid="${inputEid}"]`).press("Enter").catch(() => undefined);
-          } else {
-            await page.keyboard.press("Enter").catch(() => undefined);
-          }
+          await page.keyboard.press("Enter").catch(() => undefined);
         }
       }
     }
@@ -1866,14 +1961,34 @@ async function submitCodeWithSnapshot(
   }
 
   await waitForStability(page, 300);
+  const verify = await verifyStep(page, expectedStep, {
+    previousUrl,
+    previousStepText: previousText,
+  }).catch(() => ({ advanced: false, completed: false, error_message: "", current_step: expectedStep }));
+  return verify.advanced || verify.completed;
 }
 
-async function submitCodeSafe(page: Page, code: string, deadline: number): Promise<void> {
+async function submitCodeSafe(
+  page: Page,
+  code: string,
+  deadline: number,
+  expectedStep: number
+): Promise<boolean> {
   await injectEIDs(page);
   const snap = await captureDOMSnapshot(page);
-  await dismissOverlays(page, Math.min(deadline, now() + DISMISS_TIME_CAP_MS));
-  await submitCodeWithSnapshot(page, snap, code);
+  await nukeOverlays(page).catch(() => undefined);
+  const beforeUrl = page.url();
+  const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
+  const advanced = await submitCodeWithSnapshot(
+    page,
+    snap,
+    code,
+    expectedStep,
+    beforeUrl,
+    beforeText
+  );
   await waitForStability(page, 800);
+  return advanced;
 }
 
 async function verifyStep(
@@ -2810,6 +2925,26 @@ async function solveStep(
   const strategyUsed = variant === "unknown" ? "vision_skill_loop" : `strategy:${variant}`;
   let attemptForensics: any = null;
 
+  const hintCode = extractCodesFromHint(initialSnap.stepHintText, triedCodes);
+  if (hintCode) {
+    console.log(`[HINT_CODE] found code ${hintCode} directly in hint text, submitting`);
+    const submitted = await submitCodeSafe(page, hintCode, deadline, stepNumber);
+    if (submitted) {
+      await appendToLearningFile(stepNumber, variant, {
+        strategyUsed,
+        success: true,
+        codeFound: hintCode,
+        codeSource: "hint_text",
+        attemptsUsed: attempt,
+      });
+      return { success: true };
+    }
+    triedCodes.add(hintCode);
+    globalFailedCodes.add(hintCode);
+    console.log(`  [STALE] code ${hintCode} failed, added to triedCodes`);
+    await waitForStability(page, 100);
+  }
+
   const strategyResult = await executeStrategy(variant, page, initialSnap, triedCodes, preferredSource);
   if (strategyResult.forensics) {
     attemptForensics = strategyResult.forensics;
@@ -2819,14 +2954,8 @@ async function solveStep(
     const normalizedCode = normalizeCode(strategyResult.code);
     if (!triedCodes.has(normalizedCode)) {
       console.log(`[STRATEGY_WIN] ${variant} strategy found code ${normalizedCode}, submitting`);
-      const beforeUrl = page.url();
-      const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
-      await submitCodeSafe(page, normalizedCode, deadline);
-      const verify = await verifyStep(page, stepNumber, {
-        previousUrl: beforeUrl,
-        previousStepText: beforeText,
-      });
-      if (verify.advanced || verify.completed) {
+      const submitted = await submitCodeSafe(page, normalizedCode, deadline, stepNumber);
+      if (submitted) {
         await appendToLearningFile(stepNumber, variant, {
           strategyUsed,
           success: true,
@@ -2881,14 +3010,8 @@ async function solveStep(
       if (freshVisibleCode) {
         const normalizedCode = normalizeCode(freshVisibleCode.code);
         console.log(`  [VISIBLE_CODE_EXTRACT] found fresh code ${normalizedCode}, submitting directly`);
-        const beforeUrl = page.url();
-        const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
-        await submitCodeSafe(page, normalizedCode, deadline);
-        const visibleVerify = await verifyStep(page, stepNumber, {
-          previousUrl: beforeUrl,
-          previousStepText: beforeText,
-        });
-        if (visibleVerify.advanced || visibleVerify.completed) {
+        const submitted = await submitCodeSafe(page, normalizedCode, deadline, stepNumber);
+        if (submitted) {
           await appendToLearningFile(stepNumber, variant, {
             strategyUsed,
             success: true,
@@ -2908,20 +3031,14 @@ async function solveStep(
 
     const immediateCode = await checkForCode(page, triedCodes);
       if (immediateCode) {
-      const normalizedCode = normalizeCode(immediateCode);
+        const normalizedCode = normalizeCode(immediateCode);
       console.log(`  [VISION_FASTPATH] code found before decision: ${normalizedCode}`);
       if (triedCodes.has(normalizedCode)) {
         console.log(`  [FASTPATH_SKIP] code ${normalizedCode} already tried`);
         forceNonSubmit = true;
       } else {
-        const beforeUrl = page.url();
-        const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
-        await submitCodeSafe(page, normalizedCode, deadline);
-        const verify = await verifyStep(page, stepNumber, {
-          previousUrl: beforeUrl,
-          previousStepText: beforeText,
-        });
-        if (verify.advanced || verify.completed) {
+        const submitted = await submitCodeSafe(page, normalizedCode, deadline, stepNumber);
+        if (submitted) {
           await appendToLearningFile(stepNumber, variant, {
             strategyUsed,
             success: true,
@@ -2994,7 +3111,7 @@ async function solveStep(
     skillLogs.push(skillLog);
     console.log(`[VISION_SKILL] ${JSON.stringify(skillLog)}`);
 
-    if (result.code) {
+      if (result.code) {
       const normalizedCode = normalizeCode(result.code);
       if (triedCodes.has(normalizedCode)) {
         console.log(`  [STALE_SKIP] code ${normalizedCode} already tried, skipping`);
@@ -3004,14 +3121,8 @@ async function solveStep(
       }
 
       console.log(`  [VISION_CODE] submitting returned code ${normalizedCode}`);
-      const beforeUrl = page.url();
-      const beforeText = await page.evaluate("document.body ? document.body.innerText : ''") as string;
-      await submitCodeSafe(page, normalizedCode, deadline);
-      const verify = await verifyStep(page, stepNumber, {
-        previousUrl: beforeUrl,
-        previousStepText: beforeText,
-      });
-      if (verify.advanced || verify.completed) {
+      const submitted = await submitCodeSafe(page, normalizedCode, deadline, stepNumber);
+      if (submitted) {
         await appendToLearningFile(stepNumber, variant, {
           strategyUsed,
           success: true,
