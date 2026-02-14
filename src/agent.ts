@@ -643,9 +643,8 @@ interface HiddenCodeScanResult {
 }
 
 async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResult> {
-  const found = await page.evaluate(() => {
-      var __name = function(fn: any) { return fn; };
-    var forbidden: Record<string, boolean> = {
+  const found = await page.evaluate(`(function() {
+    var forbidden = {
       submit: true,
       cancel: true,
       button: true,
@@ -664,7 +663,7 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResu
 
     var re = /\\b[A-Za-z0-9]{6}\\b/g;
     var out = [];
-    var seen: Record<string, true> = {};
+    var seen = {};
     var nodes = Array.from(document.querySelectorAll("*"));
     var scanned = 0;
     var rawMatches = 0;
@@ -677,8 +676,8 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResu
 
       var snippets = [];
       if (node.textContent) snippets.push(node.textContent);
-      if ((node as any).innerText) snippets.push((node as any).innerText);
-      if ((node as any).value) snippets.push(String((node as any).value));
+      if (node.innerText) snippets.push(node.innerText);
+      if (node.value) snippets.push(String(node.value));
 
       if (node.attributes) {
         for (var j = 0; j < node.attributes.length; j++) {
@@ -713,7 +712,7 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResu
           out.push({
             code,
             tagName: (node.tagName || "").toLowerCase(),
-            className: ((node.className || "") as any).toString()
+            className: String((node.className || ""))
           });
         }
         re.lastIndex = 0;
@@ -726,7 +725,7 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResu
       rawMatches,
       filteredMatches
     };
-  });
+  })()`) ;
 
   return (found as HiddenCodeScanResult) || {
     candidates: [],
@@ -781,9 +780,8 @@ function detectVariant(snap: DOMSnapshot): VariantType {
 
 async function deepForensicScan(page: Page): Promise<ForensicResult> {
   try {
-    const result = await page.evaluate(() => {
-      var __name = function(fn: any) { return fn; };
-      var forbidden: Record<string, true> = {
+    const result = (await page.evaluate(`(function() {
+      var forbidden = {
         submit: true,
         cancel: true,
         button: true,
@@ -801,20 +799,20 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
       };
 
       var elements = Array.from(document.querySelectorAll("*"));
-      var textNodesWithMixedAlphanumeric: { text: string; tag: string; visible: boolean }[] = [];
-      var cssContentCodes: string[] = [];
-      var invisibleElements: { text: string; opacity: string; color: string; bg: string }[] = [];
-      var dataAttrCodes: { tag: string; attr: string; value: string }[] = [];
-      var pseudoElementCodes: string[] = [];
-      var jsVariableCodes: string[] = [];
+      var textNodesWithMixedAlphanumeric = [];
+      var cssContentCodes = [];
+      var invisibleElements = [];
+      var dataAttrCodes = [];
+      var pseudoElementCodes = [];
+      var jsVariableCodes = [];
 
-      var visible = function(el: Element) {
+      var visible = function(el) {
         var s = window.getComputedStyle(el);
         var r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
       };
 
-      var isAllowed = function(code: string) {
+      var isAllowed = function(code) {
         if (!/^([A-Z0-9]{6})$/i.test(code)) return false;
         if (!/[A-Z]/i.test(code) || !/[0-9]/.test(code)) return false;
         if (/^#?[0-9a-fA-F]{6}$/.test(code)) return false;
@@ -822,8 +820,8 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
         return true;
       };
 
-      var extract = function(text: string) {
-        var out: string[] = [];
+      var extract = function(text) {
+        var out = [];
         if (!text) return out;
         var m;
         var regex = /[A-Za-z0-9]{6}/g;
@@ -836,17 +834,17 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
         return out;
       };
 
-      var pushUnique = function(target: string[], code: string) {
+      var pushUnique = function(target, code) {
         if (target.indexOf(code) === -1) target.push(code);
       };
 
       for (var i = 0; i < elements.length; i++) {
-        var el = elements[i] as Element;
+        var el = elements[i];
         if (!el) continue;
 
         var style = window.getComputedStyle(el);
         var text = "";
-        if ((el as any).textContent) text = String((el as any).textContent || "").trim();
+        if (el.textContent) text = String(el.textContent || "").trim();
         var textCodes = extract(text);
         if (textCodes.length > 0) {
           textNodesWithMixedAlphanumeric.push({
@@ -942,7 +940,7 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
           var prop = windowKeys[k];
           if (!prop) continue;
           try {
-            var windowValue = (window as any)[prop] as unknown;
+            var windowValue = window[prop];
             if (typeof windowValue === "string") {
               var direct = extract(windowValue);
               for (var x = 0; x < direct.length; x += 1) {
@@ -951,7 +949,7 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
               continue;
             }
             if (!windowValue || typeof windowValue !== "object") continue;
-            var objectValue = windowValue as Record<string, unknown>;
+            var objectValue = windowValue;
             for (var key in objectValue) {
               if (!Object.prototype.hasOwnProperty.call(objectValue, key)) continue;
               var nestedValue = objectValue[key];
@@ -977,7 +975,7 @@ async function deepForensicScan(page: Page): Promise<ForensicResult> {
         pseudoElementCodes,
         jsVariableCodes,
       };
-    }) as ForensicResult;
+    })()`)) as ForensicResult;
 
     return {
       totalElements: result.totalElements || 0,
@@ -1029,13 +1027,12 @@ async function strategyClickReveal(page: Page, triedCodes: Set<string>): Promise
     return { success: true, code: scanCode.code, codeSource: "reveal_click" };
   }
 
-  const direct = await page.evaluate(() => {
-      var __name = function(fn: any) { return fn; };
+  const direct = await page.evaluate(`(function() {
     var re = /^[A-Za-z0-9]{6}$/i;
     var out = [];
     var nodes = Array.from(document.querySelectorAll("*"));
     for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i] as Element;
+      var el = nodes[i];
       if (!el || !el.textContent) continue;
       var text = (el.textContent || "").trim();
       if (text.length === 6 && re.test(text)) {
@@ -1043,7 +1040,7 @@ async function strategyClickReveal(page: Page, triedCodes: Set<string>): Promise
       }
     }
     return out;
-  }).catch(() => []) as string[];
+  })()`).catch(() => []) as string[];
   const directFresh = pickFreshCodeFromCandidates(direct, triedCodes);
 
   if (directFresh) {
@@ -1145,25 +1142,24 @@ function isFillerText(text: string): boolean {
 }
 
 async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<StrategyResult> {
-  await page.evaluate(() => {
-      var __name = function(fn: any) { return fn; };
+  await page.evaluate(`(function() {
     window.scrollTo(0, document.body.scrollHeight);
-  }).catch(() => undefined);
+  })()`).catch(() => undefined);
   await waitForStability(page, 500);
 
-  const button = await page.evaluate(() => {
+  const button = (await page.evaluate(`(function() {
     var nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a'));
-    var textOf = function(el: Element) {
-      var anyEl = el as HTMLElement;
-      return ((anyEl.innerText || anyEl.textContent || (anyEl as any).value || "").trim());
+    var textOf = function(el) {
+      var anyEl = el;
+      return ((anyEl.innerText || anyEl.textContent || anyEl.value || "").trim());
     };
-    var isVisible = function(el: Element) {
+    var isVisible = function(el) {
       var s = window.getComputedStyle(el);
       return s.display !== "none" && s.visibility !== "hidden";
     };
     var chosen = null;
     for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i] as Element;
+      var el = nodes[i];
       var text = textOf(el);
       if (!text) continue;
       if (!/(next|continue|navigate)/i.test(text)) continue;
@@ -1176,7 +1172,7 @@ async function strategyScrollNav(page: Page, triedCodes: Set<string>): Promise<S
       }
     }
     return chosen;
-  }).catch(() => null);
+  })()`).catch(() => null)) as { eid: string; text: string } | null;
 
   if (!button) {
     return { success: false };
@@ -1634,51 +1630,52 @@ async function restoreOverlayShields(page: Page): Promise<void> {
 
 async function nukeOverlays(page: Page): Promise<number> {
   return page
-    .evaluate(() => {
-    var all = document.querySelectorAll("*");
-    var vw = window.innerWidth || 1;
-    var vh = window.innerHeight || 1;
-    var vArea = vw * vh;
-    var decoyPattern = /cookie|consent|newsletter|subscribe|warning|alert|limited time|special offer/i;
-    var codePattern = /\\b[A-Z0-9]{6}\\b/i;
-    var skipped = [];
-    var nuked = 0;
+    .evaluate(`(function() {
+      var all = document.querySelectorAll("*");
+      var vw = window.innerWidth || 1;
+      var vh = window.innerHeight || 1;
+      var vArea = vw * vh;
+      var decoyPattern = /cookie|consent|newsletter|subscribe|warning|alert|limited time|special offer/i;
+      var codePattern = /\\b[A-Z0-9]{6}\\b/i;
+      var skipped = [];
+      var nuked = 0;
 
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i] as HTMLElement;
-      if (el.closest("body") !== document.body) continue;
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (!(el instanceof HTMLElement)) continue;
+        if (el.closest("body") !== document.body) continue;
 
-      var style = window.getComputedStyle(el);
-      var position = style.position;
-      if (position !== "fixed" && position !== "absolute") continue;
-      if (el.dataset && el.dataset.nuked === "true") continue;
+        var style = window.getComputedStyle(el);
+        var position = style.position;
+        if (position !== "fixed" && position !== "absolute") continue;
+        if (el.dataset && el.dataset.nuked === "true") continue;
 
-      var rect = el.getBoundingClientRect();
-      var area = Math.max(0, rect.width) * Math.max(0, rect.height);
-      var big = area > vArea * 0.3;
-      var text = (el.textContent || "").toUpperCase();
-      var z = parseInt(style.zIndex || "0", 10);
-      var highZ = !isNaN(z) && z > 100;
-      var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
+        var rect = el.getBoundingClientRect();
+        var area = Math.max(0, rect.width) * Math.max(0, rect.height);
+        var big = area > vArea * 0.3;
+        var text = (el.textContent || "").toUpperCase();
+        var z = parseInt(style.zIndex || "0", 10);
+        var highZ = !isNaN(z) && z > 100;
+        var decoy = decoyPattern.test(text) && (position === "fixed" || position === "absolute" || highZ);
 
-      if (big || decoy) {
-        if (codePattern.test(text)) {
-          var tag = (el.tagName || "unknown").toLowerCase();
-          var classes = (el.className || "").toString().trim().replace(/\\s+/g, ".");
-          skipped.push(classes ? `${tag}.${classes}` : tag);
-          continue;
-        }
-        var current = el.style.display || "";
-        if (current !== "none") {
-          el.style.display = "none";
-          el.dataset.nuked = "true";
-          nuked += 1;
+        if (big || decoy) {
+          if (codePattern.test(text)) {
+            var tag = (el.tagName || "unknown").toLowerCase();
+            var classes = (el.className || "").toString().trim().replace(/\\s+/g, ".");
+            skipped.push(classes ? tag + "." + classes : tag);
+            continue;
+          }
+          var current = el.style.display || "";
+          if (current !== "none") {
+            el.style.display = "none";
+            el.dataset.nuked = "true";
+            nuked += 1;
+          }
         }
       }
-    }
 
-    return { nuked, skipped };
-  })
+      return { nuked: nuked, skipped: skipped };
+    })()`)
     .then((result) => {
       const typed = result as { nuked: number; skipped: string[] } | null;
       if (typed && typed.skipped && typed.skipped.length > 0) {
@@ -2503,8 +2500,8 @@ async function captureVisionScreenshot(
 ): Promise<string> {
   await nukeOverlays(page).catch(() => undefined);
 
-  await page.evaluate((items: CandidateForClick[]) => {
-      var __name = function(fn: any) { return fn; };
+  const overlayCandidates = JSON.stringify(candidates);
+  await page.evaluate(`(function(items) {
     const previous = document.querySelectorAll('[data-som-overlay="1"]');
     previous.forEach((node) => node.remove());
 
@@ -2525,10 +2522,10 @@ async function captureVisionScreenshot(
 
       const rect = document.createElement("div");
       rect.style.position = "fixed";
-      rect.style.left = `${x}px`;
-      rect.style.top = `${y}px`;
-      rect.style.width = `${w}px`;
-      rect.style.height = `${h}px`;
+      rect.style.left = x + "px";
+      rect.style.top = y + "px";
+      rect.style.width = w + "px";
+      rect.style.height = h + "px";
       rect.style.border = "2px solid #ff6f00";
       rect.style.boxSizing = "border-box";
       rect.style.background = "rgba(255, 111, 0, 0.08)";
@@ -2551,7 +2548,7 @@ async function captureVisionScreenshot(
     }
 
     document.body.appendChild(layer);
-  }, candidates).catch(() => undefined);
+  })(${overlayCandidates})`).catch(() => undefined);
 
   const encoded = await screenshot(page, label);
   await page.evaluate(`(function() { var nodes = document.querySelectorAll('[data-som-overlay="1"]'); nodes.forEach((n) => n.remove()); })()`)
@@ -2884,11 +2881,11 @@ async function runVisionSkill(
     })()`).catch(() => undefined);
   } else {
     const maxScrollY = await page
-      .evaluate(() => {
+      .evaluate(`(function() {
         var scrolling = document.scrollingElement || document.documentElement || document.body;
         if (!scrolling) return 0;
         return Math.max(0, scrolling.scrollHeight - window.innerHeight);
-      })
+      })()`)
       .catch(() => 0) as number;
     const randomY = maxScrollY > 0 ? Math.floor(Math.random() * (maxScrollY + 1)) : 0;
     await page
