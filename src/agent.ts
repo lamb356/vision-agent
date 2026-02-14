@@ -381,6 +381,10 @@ function isPlausibleCodeCandidate(code: string): boolean {
   return true;
 }
 
+function normalizeCode(code: string): string {
+  return code.trim().toUpperCase();
+}
+
 // Log the DOM source of a phantom code once (debugging where it comes from)
 const loggedDomOnlyCodes = new Set<string>();
 
@@ -1670,7 +1674,8 @@ function buildVisionPrompt(
   attempt: number,
   turn: number,
   state: VisionSkillPlanState,
-  candidates: CandidateForClick[]
+  candidates: CandidateForClick[],
+  failedCodes: string[]
 ): string {
   const payload = {
     mission: "Pick exactly one safe skill for this turn.",
@@ -1682,16 +1687,23 @@ function buildVisionPrompt(
     step_hint: snap.stepHintText.slice(0, 180),
     visible_codes: snap.codesFound.slice(0, 6),
     features: snap.features,
+    failedCodes: failedCodes.slice(0, 12),
     top_candidates: candidates,
   };
 
-  return `${VISION_SKILL_PROMPT}\n\n${VISION_SKILL_FEW_SHOT_EXAMPLES}\n\nSTATE_JSON:\n${JSON.stringify(payload)}`;
+  const failedLine = failedCodes.length > 0
+    ? `\n\nPreviously failed codes (do NOT re-submit these): ${failedCodes.join(", ")}`
+    : "\n\nPreviously failed codes (do NOT re-submit these): none";
+
+  return `${VISION_SKILL_PROMPT}\n\n${VISION_SKILL_FEW_SHOT_EXAMPLES}${failedLine}\n\nSTATE_JSON:\n${JSON.stringify(payload)}`;
 }
 
 function sanitizeVisionDecision(
   parsed: VisionSkillDecision,
   snap: DOMSnapshot,
-  state: VisionSkillPlanState
+  state: VisionSkillPlanState,
+  triedCodes?: Set<string>,
+  forceNonSubmit?: boolean
 ): VisionSkillDecision {
   const valid = new Set<VisionSkill>([
     "scroll_search",
@@ -1724,9 +1736,16 @@ function sanitizeVisionDecision(
 
   if (parsed.skill === "submit_code") {
     const code = (parsed.params?.code ?? "").trim().toUpperCase();
-    if (!isPlausibleCodeCandidate(code)) {
-      parsed.skill = "scroll_search";
-      parsed.params = {};
+    const tried = triedCodes ? triedCodes.has(code) : false;
+    if (!isPlausibleCodeCandidate(code) || Boolean(forceNonSubmit) || tried) {
+      const candidates = buildTopCandidates(snap);
+      if (candidates[0]?.eid) {
+        parsed.skill = "click_candidate";
+        parsed.params = { eid: candidates[0].eid };
+      } else {
+        parsed.skill = "scroll_search";
+        parsed.params = {};
+      }
     } else {
       parsed.params.code = code;
     }
@@ -1743,7 +1762,9 @@ async function chooseVisionSkill(
   stepNumber: number,
   attempt: number,
   turn: number,
-  state: VisionSkillPlanState
+  state: VisionSkillPlanState,
+  triedCodes: Set<string>,
+  forceNonSubmit?: boolean
 ): Promise<VisionSkillDecision> {
   const candidates = buildTopCandidates(snap);
   if (state.stuck) {
@@ -1755,7 +1776,16 @@ async function chooseVisionSkill(
   }
 
   try {
-    const prompt = buildVisionPrompt(snap, stepNumber, attempt, turn, state, candidates);
+    const failedCodes = Array.from(triedCodes).filter(isPlausibleCodeCandidate);
+    const prompt = buildVisionPrompt(
+      snap,
+      stepNumber,
+      attempt,
+      turn,
+      state,
+      candidates,
+      failedCodes
+    );
     const img = await captureVisionScreenshot(
       page,
       candidates,
@@ -1769,7 +1799,7 @@ async function chooseVisionSkill(
       256
     );
 
-    const parsed = sanitizeVisionDecision(raw.parsed, snap, state);
+    const parsed = sanitizeVisionDecision(raw.parsed, snap, state, triedCodes, forceNonSubmit);
     return parsed;
   } catch (err) {
     console.log(`  [VISION_DECISION] fallback decision due to Gemini error: ${err instanceof Error ? err.message : `${err}`}`);
@@ -1974,6 +2004,7 @@ async function solveStep(
   const triedCodes = new Set<string>(globalFailedCodes);
   const triedEids = new Set<string>();
   let explorePass = 0;
+  let forceNonSubmit = false;
   stateRepeatLog.clear();
 
   for (let turn = 1; turn <= MAX_VISION_SKILL_TURNS && withinDeadline(deadline); turn += 1) {
@@ -1989,13 +2020,19 @@ async function solveStep(
 
     const immediateCode = await checkForCode(page, triedCodes);
     if (immediateCode) {
-      console.log(`  [VISION_FASTPATH] code found before decision: ${immediateCode}`);
-      await submitCodeSafe(page, immediateCode, deadline);
-      const verify = await verifyStep(page, stepNumber);
-      if (verify.advanced || verify.completed) return { success: true };
-      triedCodes.add(immediateCode);
-      globalFailedCodes.add(immediateCode);
-      console.log(`  [STALE] code ${immediateCode} failed, added to triedCodes`);
+      const normalizedCode = normalizeCode(immediateCode);
+      console.log(`  [VISION_FASTPATH] code found before decision: ${normalizedCode}`);
+      if (triedCodes.has(normalizedCode)) {
+        console.log(`  [FASTPATH_SKIP] code ${normalizedCode} already tried`);
+        forceNonSubmit = true;
+      } else {
+        await submitCodeSafe(page, normalizedCode, deadline);
+        const verify = await verifyStep(page, stepNumber);
+        if (verify.advanced || verify.completed) return { success: true };
+        triedCodes.add(normalizedCode);
+        globalFailedCodes.add(normalizedCode);
+        console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
+      }
       await waitForStability(page, 100);
     }
 
@@ -2016,8 +2053,11 @@ async function solveStep(
       stepNumber,
       attempt,
       turn,
-      state
+      state,
+      triedCodes,
+      forceNonSubmit
     );
+    forceNonSubmit = false;
 
     if (decision.skill === "explore") {
       explorePass += 1;
@@ -2049,14 +2089,22 @@ async function solveStep(
     skillLogs.push(skillLog);
     console.log(`[VISION_SKILL] ${JSON.stringify(skillLog)}`);
 
-    if (result.code && !triedCodes.has(result.code)) {
-      console.log(`  [VISION_CODE] submitting returned code ${result.code}`);
-      await submitCodeSafe(page, result.code, deadline);
+    if (result.code) {
+      const normalizedCode = normalizeCode(result.code);
+      if (triedCodes.has(normalizedCode)) {
+        console.log(`  [STALE_SKIP] code ${normalizedCode} already tried, skipping`);
+        forceNonSubmit = true;
+        await waitForStability(page, 120);
+        continue;
+      }
+
+      console.log(`  [VISION_CODE] submitting returned code ${normalizedCode}`);
+      await submitCodeSafe(page, normalizedCode, deadline);
       const verify = await verifyStep(page, stepNumber);
       if (verify.advanced || verify.completed) return { success: true };
-      triedCodes.add(result.code);
-      globalFailedCodes.add(result.code);
-      console.log(`  [STALE] code ${result.code} failed, added to triedCodes`);
+      triedCodes.add(normalizedCode);
+      globalFailedCodes.add(normalizedCode);
+      console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
       await waitForStability(page, 100);
     }
 
