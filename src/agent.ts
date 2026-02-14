@@ -472,16 +472,44 @@ interface HiddenCodeCandidate {
   className: string;
 }
 
-async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeCandidate[]> {
+interface HiddenCodeScanResult {
+  candidates: HiddenCodeCandidate[];
+  scanned: number;
+  rawMatches: number;
+  filteredMatches: number;
+}
+
+async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeScanResult> {
   const found = await page.evaluate(() => {
+    var forbidden: Record<string, boolean> = {
+      submit: true,
+      cancel: true,
+      button: true,
+      scroll: true,
+      cookie: true,
+      consent: true,
+      warning: true,
+      alert: true,
+      next: true,
+      proceed: true,
+      advance: true,
+      retry: true,
+      close: true,
+      confirm: true,
+    };
+
     var re = /\\b[A-Za-z0-9]{6}\\b/g;
     var out = [];
-    var seen = {} as Record<string, true>;
+    var seen: Record<string, true> = {};
     var nodes = Array.from(document.querySelectorAll("*"));
+    var scanned = 0;
+    var rawMatches = 0;
+    var filteredMatches = 0;
 
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
       if (!node) continue;
+      scanned += 1;
 
       var snippets = [];
       if (node.textContent) snippets.push(node.textContent);
@@ -503,8 +531,21 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeCandidat
         var m;
         while ((m = re.exec(text)) !== null) {
           var code = String(m[0]).toUpperCase();
+          rawMatches += 1;
+
+          if (!/[A-Z]/.test(code) || !/[0-9]/.test(code)) {
+            continue;
+          }
+          if (/^#?[0-9a-fA-F]{6}$/.test(code)) {
+            continue;
+          }
+          if (forbidden[code.toLowerCase()]) {
+            continue;
+          }
+
           if (seen[code]) continue;
           seen[code] = true;
+          filteredMatches += 1;
           out.push({
             code,
             tagName: (node.tagName || "").toLowerCase(),
@@ -515,10 +556,20 @@ async function extractHiddenCodesFromDOM(page: Page): Promise<HiddenCodeCandidat
       }
     }
 
-    return out;
+    return {
+      candidates: out,
+      scanned,
+      rawMatches,
+      filteredMatches
+    };
   });
 
-  return (found as HiddenCodeCandidate[]) || [];
+  return (found as HiddenCodeScanResult) || {
+    candidates: [],
+    scanned: 0,
+    rawMatches: 0,
+    filteredMatches: 0,
+  };
 }
 
 async function detectTrap(page: Page): Promise<boolean> {
@@ -2090,8 +2141,14 @@ async function solveStep(
   let consecutiveScrollFails = 0;
   stateRepeatLog.clear();
 
-  const preLoopHidden = await extractHiddenCodesFromDOM(page).catch(() => []);
-  const freshHiddenCode = preLoopHidden.find((candidate) => !triedCodes.has(candidate.code));
+  const preLoopScan = await extractHiddenCodesFromDOM(page).catch(() => ({
+    candidates: [],
+    scanned: 0,
+    rawMatches: 0,
+    filteredMatches: 0,
+  }));
+  console.log(`[DOM_SCAN] scanned ${preLoopScan.scanned} elements, found ${preLoopScan.rawMatches} raw matches, ${preLoopScan.filteredMatches} after filtering`);
+  const freshHiddenCode = preLoopScan.candidates.find((candidate) => !triedCodes.has(candidate.code));
   if (freshHiddenCode) {
     const normalizedCode = normalizeCode(freshHiddenCode.code);
     const classes = freshHiddenCode.className
@@ -2121,6 +2178,30 @@ async function solveStep(
     const verifyBefore = await verifyStep(page, stepNumber);
     if (verifyBefore.advanced || verifyBefore.completed) {
       return { success: true };
+    }
+
+    if (snap.features.hasCodeVisible) {
+      const visibleScan = await extractHiddenCodesFromDOM(page).catch(() => ({
+        candidates: [],
+        scanned: 0,
+        rawMatches: 0,
+        filteredMatches: 0,
+      }));
+      console.log(`[DOM_SCAN] scanned ${visibleScan.scanned} elements, found ${visibleScan.rawMatches} raw matches, ${visibleScan.filteredMatches} after filtering`);
+
+      const freshVisibleCode = visibleScan.candidates.find((candidate) => !triedCodes.has(candidate.code));
+      if (freshVisibleCode) {
+        const normalizedCode = normalizeCode(freshVisibleCode.code);
+        console.log(`  [VISIBLE_CODE_EXTRACT] found fresh code ${normalizedCode}, submitting directly`);
+        await submitCodeSafe(page, normalizedCode, deadline);
+        const visibleVerify = await verifyStep(page, stepNumber);
+        if (visibleVerify.advanced || visibleVerify.completed) return { success: true };
+        triedCodes.add(normalizedCode);
+        globalFailedCodes.add(normalizedCode);
+        console.log(`  [STALE] code ${normalizedCode} failed, added to triedCodes`);
+        await waitForStability(page, 100);
+        continue;
+      }
     }
 
     const immediateCode = await checkForCode(page, triedCodes);
