@@ -103,6 +103,11 @@ Overlay clearing safety:
 - NEVER hide elements containing challenge text like `Hidden DOM`, `Reveal Code`, `Submit Code`, `Enter 6-character`, `Hover`, `Step N of 30`.
 - Hiding the challenge content makes it impossible to solve.
 
+Modal helper rule:
+- When you see `Please Select an Option`, call `window.__solveModal()` first.
+- It handles modal detection, scrolling, selecting the correct radio, and clicking submit/continue.
+- Only attempt manual modal solving if it returns `solved: false`.
+
 ## Wrong Button Detection
 
 If you see "Wrong Button" appear in the changes, the button you clicked was a TRAP. Do NOT click it again. Look for a different button, often the real button is hidden, has a different label, or requires scrolling to find.

@@ -512,7 +512,7 @@ function forceAdvanceStepCode(targetStep: number): string {
 async function installHiddenDomHelper(page: Page): Promise<void> {
   try {
     await page.evaluate(`(function(){
-      if (window.__solveHiddenDOM && window.__findHoverTargets && window.__solveClickReveal && window.__clearOverlays) {
+      if (window.__solveHiddenDOM && window.__findHoverTargets && window.__solveClickReveal && window.__clearOverlays && window.__solveModal) {
         return 'exists';
       }
 
@@ -643,6 +643,164 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           }
         }
         return { cleared: cleared };
+      };
+
+      window.__solveModal = function() {
+        function textOf(el) {
+          return String((el && el.textContent) || '').trim();
+        }
+
+        function lower(text) {
+          return String(text || '').toLowerCase();
+        }
+
+        function isVisible(el) {
+          if (!el) {
+            return false;
+          }
+          var style = window.getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden' && style.pointerEvents !== 'none';
+        }
+
+        function findModal() {
+          var modal = document.querySelector('div.fixed[style*="z-index: 9996"]');
+          if (modal) {
+            return modal;
+          }
+
+          var fixedDivs = Array.from(document.querySelectorAll('div.fixed'));
+          for (var i = 0; i < fixedDivs.length; i += 1) {
+            var fixedText = lower(textOf(fixedDivs[i]));
+            if (fixedText.indexOf('please select an option') !== -1) {
+              return fixedDivs[i];
+            }
+          }
+
+          var allDivs = Array.from(document.querySelectorAll('div'));
+          for (var j = 0; j < allDivs.length; j += 1) {
+            var el = allDivs[j];
+            var style = window.getComputedStyle(el);
+            var z = parseInt(style.zIndex || '0', 10) || 0;
+            if (style.position === 'fixed' && z > 9000) {
+              return el;
+            }
+          }
+
+          return null;
+        }
+
+        var modal = findModal();
+        if (!modal) {
+          return { solved: false, action: 'modal-not-found' };
+        }
+
+        var actionParts = [];
+        var scrollables = Array.from(modal.querySelectorAll('div')).filter(function(el) {
+          var style = window.getComputedStyle(el);
+          var overflowY = String(style.overflowY || '').toLowerCase();
+          return (
+            el.scrollHeight > el.clientHeight &&
+            (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay')
+          );
+        });
+        if (scrollables.length) {
+          var scroller = scrollables[0];
+          scroller.scrollTop = scroller.scrollHeight;
+          actionParts.push('scrolled-modal');
+        }
+
+        var correctPhrases = ['correct choice', 'correct answer', 'the right choice', 'this is correct'];
+        var labels = Array.from(modal.querySelectorAll('label'));
+        if (!labels.length) {
+          labels = Array.from(document.querySelectorAll('label'));
+        }
+
+        var selected = false;
+        for (var k = 0; k < labels.length; k += 1) {
+          var label = labels[k];
+          var labelText = lower(textOf(label));
+          var isCorrect = false;
+          for (var cp = 0; cp < correctPhrases.length; cp += 1) {
+            if (labelText.indexOf(correctPhrases[cp]) !== -1) {
+              isCorrect = true;
+              break;
+            }
+          }
+          if (!isCorrect) {
+            continue;
+          }
+
+          var targetRadio = null;
+          var forId = label.getAttribute('for');
+          if (forId) {
+            targetRadio = document.getElementById(forId);
+          }
+          if (!targetRadio) {
+            targetRadio = label.querySelector('input[type="radio"]');
+          }
+          if (!targetRadio) {
+            continue;
+          }
+
+          if (window.__codexReactForm && typeof window.__codexReactForm.setChecked === 'function') {
+            window.__codexReactForm.setChecked(targetRadio, true);
+          } else {
+            try {
+              var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked');
+              if (nativeSetter && nativeSetter.set) {
+                nativeSetter.set.call(targetRadio, true);
+              } else {
+                targetRadio.checked = true;
+              }
+              targetRadio.dispatchEvent(new Event('input', { bubbles: true }));
+              targetRadio.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch (_) {
+              targetRadio.checked = true;
+            }
+          }
+
+          selected = true;
+          actionParts.push('selected-correct-radio');
+          break;
+        }
+
+        var buttonPhrases = ['submit', 'continue', 'ok', 'confirm', 'continue journey', 'submit code', 'submit & continue'];
+        var buttons = Array.from(modal.querySelectorAll('button, [role="button"]'));
+        if (!buttons.length) {
+          buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        }
+
+        var clicked = false;
+        for (var b = 0; b < buttons.length; b += 1) {
+          var btn = buttons[b];
+          if (!isVisible(btn)) {
+            continue;
+          }
+          var btnText = lower(textOf(btn));
+          var matched = false;
+          for (var bp = 0; bp < buttonPhrases.length; bp += 1) {
+            if (btnText.indexOf(buttonPhrases[bp]) !== -1) {
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            continue;
+          }
+          btn.click();
+          clicked = true;
+          actionParts.push('clicked-modal-button:' + btnText.slice(0, 40));
+          break;
+        }
+
+        var solved = !!(selected || clicked);
+        if (!actionParts.length) {
+          actionParts.push('modal-found-no-action');
+        }
+        return {
+          solved: solved,
+          action: actionParts.join(', ')
+        };
       };
 
       function delayMs(ms) {
@@ -1012,11 +1170,16 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
           typeof window.__clearOverlays === 'function'
             ? window.__clearOverlays()
             : { cleared: 0, source: 'clear-helper-missing' };
+        var modalResult =
+          typeof window.__solveModal === 'function'
+            ? window.__solveModal()
+            : { solved: false, action: 'modal-helper-missing' };
         var draggableCount = document.querySelectorAll('div[draggable="true"]').length;
         var dragDetected = draggableCount >= 3;
         if (dragDetected) {
           return {
             clear: clearResult,
+            modal: modalResult,
             dragDetected: true,
             draggableCount: draggableCount
           };
@@ -1031,6 +1194,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
             : { code: null, source: 'click-helper-missing' };
         return {
           clear: clearResult,
+          modal: modalResult,
           hidden: hiddenResult,
           clickReveal: clickRevealResult,
           dragDetected: false,
@@ -1041,12 +1205,18 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       var rootObject =
         preScanResult && typeof preScanResult === 'object'
           ? (preScanResult as Record<string, unknown>)
-          : ({ clear: { cleared: 0 }, hidden: { code: null, source: 'invalid-result' }, clickReveal: { code: null, source: 'invalid-result' }, dragDetected: false, draggableCount: 0 } as Record<string, unknown>);
+          : ({ clear: { cleared: 0 }, modal: { solved: false, action: 'invalid-modal' }, hidden: { code: null, source: 'invalid-result' }, clickReveal: { code: null, source: 'invalid-result' }, dragDetected: false, draggableCount: 0 } as Record<string, unknown>);
 
       var clearObject =
         rootObject.clear && typeof rootObject.clear === 'object'
           ? (rootObject.clear as Record<string, unknown>)
           : ({ cleared: 0 } as Record<string, unknown>);
+      var modalObject =
+        rootObject.modal && typeof rootObject.modal === 'object'
+          ? (rootObject.modal as Record<string, unknown>)
+          : ({ solved: false, action: 'invalid-modal' } as Record<string, unknown>);
+      var modalSolved = modalObject.solved === true;
+      var modalAction = typeof modalObject.action === 'string' ? modalObject.action : 'modal-unknown';
       var dragDetected = rootObject.dragDetected === true;
       var draggableCount =
         typeof rootObject.draggableCount === 'number' && Number.isFinite(rootObject.draggableCount)
@@ -1094,9 +1264,10 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
         logAgent('Pre-scan detected drag-and-drop. Auto-skipped.');
         logAgent(`Pre-scan auto-skip result for step ${stepNumber}: ${truncate(preScanSkipText, 180)}`);
+        logAgent(`Pre-scan modal result for step ${stepNumber}: solved=${modalSolved} action=${truncate(modalAction, 120)}`);
         appendPriorityDirective(autoSkipSucceeded
-          ? `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) and auto-skipped via nav.`
-          : `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) but auto-skip failed. Continue normal solving flow.`);
+          ? `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) and auto-skipped via nav. __solveModal() returned {solved: ${modalSolved}, action: '${modalAction}'}.`
+          : `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) but auto-skip failed. __solveModal() returned {solved: ${modalSolved}, action: '${modalAction}'}. Continue normal solving flow.`);
         messages.push({
           role: 'user',
           parts: [{ text: `<status>Pre-scan detected drag-and-drop. Auto-skipped. (${truncate(preScanSkipText, 120)})</status>` }]
@@ -1155,20 +1326,20 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
       if (preScanCode) {
         appendPriorityDirective(
-          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveHiddenDOM() returned {code: ${hiddenCodeText}, source: '${hiddenSource}'}. __solveClickReveal() returned {code: ${clickCodeText}, source: '${clickRevealSource}'}. Candidate code '${preScanCode}' from '${preScanSource}'. You may submit this code or investigate further.`
+          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveModal() returned {solved: ${modalSolved}, action: '${modalAction}'}. __solveHiddenDOM() returned {code: ${hiddenCodeText}, source: '${hiddenSource}'}. __solveClickReveal() returned {code: ${clickCodeText}, source: '${clickRevealSource}'}. Candidate code '${preScanCode}' from '${preScanSource}'. You may submit this code or investigate further.`
         );
       } else {
         appendPriorityDirective(
-          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveHiddenDOM() returned {code: null, source: '${hiddenSource}'}. __solveClickReveal() returned {code: null, source: '${clickRevealSource}'}. The code is not in standard DOM locations yet. Try other approaches.`
+          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveModal() returned {solved: ${modalSolved}, action: '${modalAction}'}. __solveHiddenDOM() returned {code: null, source: '${hiddenSource}'}. __solveClickReveal() returned {code: null, source: '${clickRevealSource}'}. The code is not in standard DOM locations yet. Try other approaches.`
         );
       }
       logAgent(
-        `Pre-scan completed for step ${stepNumber}: clear=${clearedCount} hidden=${hiddenCode ?? 'null'}(${hiddenSource}) clickReveal=${clickRevealCode ?? 'null'}(${clickRevealSource})`
+        `Pre-scan completed for step ${stepNumber}: clear=${clearedCount} modal=${modalSolved}(${truncate(modalAction, 80)}) hidden=${hiddenCode ?? 'null'}(${hiddenSource}) clickReveal=${clickRevealCode ?? 'null'}(${clickRevealSource})`
       );
       return 'none';
     } catch (error) {
       appendPriorityDirective(
-        "Pre-scan results: __clearOverlays(), __solveHiddenDOM(), and __solveClickReveal failed with pre-scan-error. The code is not in standard DOM locations yet. Try other approaches."
+        "Pre-scan results: __clearOverlays(), __solveModal(), __solveHiddenDOM(), and __solveClickReveal failed with pre-scan-error. The code is not in standard DOM locations yet. Try other approaches."
       );
       logAgent(`Pre-scan failed for step ${stepNumber}: ${error instanceof Error ? error.message : String(error)}`);
       return 'none';
