@@ -518,10 +518,22 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
 
       var CODE_EXACT = /^[A-Z0-9]{6}$/;
       var CODE_ANY = /\\b([A-Z0-9]{6})\\b/;
+      var SKIP_ATTRS = {
+        type: true, class: true, id: true, name: true, src: true, href: true, action: true, method: true, rel: true,
+        charset: true, lang: true, dir: true, style: true, role: true, tabindex: true, target: true, media: true,
+        crossorigin: true, async: true, defer: true, integrity: true, placeholder: true, for: true, value: true,
+        checked: true, disabled: true, readonly: true, selected: true, multiple: true, required: true, autofocus: true,
+        autocomplete: true, enctype: true, novalidate: true, formaction: true, formmethod: true, width: true, height: true,
+        colspan: true, rowspan: true
+      };
+      var SKIP_LITERAL_VALUES = {
+        module: true, text: true, submit: true, button: true, hidden: true, checkbox: true, radio: true, password: true,
+        number: true, search: true
+      };
 
       function normalizeCandidate(value) {
         var cleaned = String(value || '').replace(/['"]/g, '').trim().toUpperCase();
-        if (CODE_EXACT.test(cleaned)) {
+        if (CODE_EXACT.test(cleaned) && !SKIP_LITERAL_VALUES[cleaned.toLowerCase()]) {
           return cleaned;
         }
         return null;
@@ -585,11 +597,21 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
 
         var allEls = document.querySelectorAll('*');
 
-        // 1) Scan data-* and ALL attributes on every element.
+        // 1) Scan likely code-bearing attributes.
         for (var i = 0; i < allEls.length; i += 1) {
           var el = allEls[i];
           for (var j = 0; j < el.attributes.length; j += 1) {
             var attr = el.attributes[j];
+            var attrName = String(attr.name || '').toLowerCase();
+            var allowedByName =
+              attrName.indexOf('data-') === 0 ||
+              attrName.indexOf('aria-') === 0 ||
+              attrName === 'title' ||
+              attrName === 'alt' ||
+              !SKIP_ATTRS[attrName];
+            if (!allowedByName) {
+              continue;
+            }
             var value = (attr.value || '').trim();
             var attrCode = normalizeCandidate(value);
             if (attrCode) {
