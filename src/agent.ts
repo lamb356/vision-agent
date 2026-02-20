@@ -1046,11 +1046,10 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
     var modelResponse = '';
     try {
-      var isStuckBudget = stepToolCalls >= 4;
       modelResponse = await callGemini(messages, agentPrompt, process.env.GEMINI_MODEL, {
         temperature: 0.15,
-        maxTokens: isStuckBudget ? 800 : 600,
-        thinkingBudget: isStuckBudget ? 256 : 128
+        maxTokens: 1600,
+        thinkingBudget: 384
       });
       consecutiveModelFailures = 0;
     } catch (error) {
