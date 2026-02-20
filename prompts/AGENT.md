@@ -171,6 +171,17 @@ For Hidden DOM Challenge, call `window.__solveHiddenDOM()` first. This helper:
 If `window.__solveHiddenDOM()` returns a `code`, submit it immediately.
 If it returns `code: null`, call it once more, then hard skip.
 
+When you see text containing `click here` and `times to reveal`, call `window.__solveClickReveal()` instead of manually clicking:
+- Use async IIFE form and await it:
+```js
+(async () => {
+  var revealResult = await window.__solveClickReveal();
+  return revealResult;
+})()
+```
+- Check the returned object for `code`.
+- Do NOT manually click reveal text yourself.
+
 ## Response Format
 
 Always respond with either:

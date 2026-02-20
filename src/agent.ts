@@ -645,7 +645,23 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
         return { cleared: cleared };
       };
 
-      window.__solveClickReveal = function() {
+      function delayMs(ms) {
+        return new Promise(function(resolve) { setTimeout(resolve, ms); });
+      }
+
+      async function clickWithDelay(el, times) {
+        for (var i = 0; i < times; i += 1) {
+          try {
+            el.click();
+          } catch (_) {
+            // Ignore click errors.
+          }
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          await delayMs(100);
+        }
+      }
+
+      window.__solveClickReveal = async function() {
         if (!document.body) {
           return { code: null, source: 'click-reveal-not-found' };
         }
@@ -693,14 +709,7 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
             target.closest('p, span, div, strong, em, a, li, section, article') || target.parentElement || document.body;
           var beforeCodes = collectCodesInSubtree(surrounding);
 
-          for (var c = 0; c < 10; c += 1) {
-            try {
-              target.click();
-            } catch (_) {
-              // Ignore click errors.
-            }
-            target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          }
+          await clickWithDelay(target, 10);
 
           var afterCodes = collectCodesInSubtree(surrounding);
           for (var a = 0; a < afterCodes.length; a += 1) {
@@ -994,37 +1003,122 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     return true;
   };
 
-  var runHiddenDomPreScan = async (stepNumber: number): Promise<void> => {
+  var runHiddenDomPreScan = async (stepNumber: number): Promise<boolean> => {
     try {
-      var preScanResult = await page.evaluate(`(() => {
+      var preScanResult = await page.evaluate(`(async () => {
         var clearResult =
           typeof window.__clearOverlays === 'function'
             ? window.__clearOverlays()
             : { cleared: 0, source: 'clear-helper-missing' };
+        var draggableCount = document.querySelectorAll('div[draggable="true"]').length;
+        var dragDetected = draggableCount >= 3;
+        if (dragDetected) {
+          return {
+            clear: clearResult,
+            dragDetected: true,
+            draggableCount: draggableCount
+          };
+        }
         var hiddenResult =
           typeof window.__solveHiddenDOM === 'function'
             ? window.__solveHiddenDOM()
             : { code: null, source: 'hidden-helper-missing' };
         var clickRevealResult =
           typeof window.__solveClickReveal === 'function'
-            ? window.__solveClickReveal()
+            ? await window.__solveClickReveal()
             : { code: null, source: 'click-helper-missing' };
         return {
           clear: clearResult,
           hidden: hiddenResult,
-          clickReveal: clickRevealResult
+          clickReveal: clickRevealResult,
+          dragDetected: false,
+          draggableCount: draggableCount
         };
       })()`);
 
       var rootObject =
         preScanResult && typeof preScanResult === 'object'
           ? (preScanResult as Record<string, unknown>)
-          : ({ clear: { cleared: 0 }, hidden: { code: null, source: 'invalid-result' }, clickReveal: { code: null, source: 'invalid-result' } } as Record<string, unknown>);
+          : ({ clear: { cleared: 0 }, hidden: { code: null, source: 'invalid-result' }, clickReveal: { code: null, source: 'invalid-result' }, dragDetected: false, draggableCount: 0 } as Record<string, unknown>);
 
       var clearObject =
         rootObject.clear && typeof rootObject.clear === 'object'
           ? (rootObject.clear as Record<string, unknown>)
           : ({ cleared: 0 } as Record<string, unknown>);
+      var dragDetected = rootObject.dragDetected === true;
+      var draggableCount =
+        typeof rootObject.draggableCount === 'number' && Number.isFinite(rootObject.draggableCount)
+          ? Math.max(0, Math.floor(rootObject.draggableCount))
+          : 0;
+      var clearedCount =
+        typeof clearObject.cleared === 'number' && Number.isFinite(clearObject.cleared)
+          ? Math.max(0, Math.floor(clearObject.cleared))
+          : 0;
+
+      if (dragDetected) {
+        toolCalls += 1;
+        stepToolCalls += 1;
+        var preScanSkipResult = await jsTool(
+          page,
+          `(() => {
+            var labels = ['Click Me!', 'Here!', 'Link!', 'Button!', 'Try This!', 'Click Here!'];
+            var navButtons = Array.from(document.querySelectorAll('div.absolute')).filter(function(el) {
+              var text = (el.textContent || '').trim();
+              return labels.includes(text);
+            });
+            navButtons.sort(function(a, b) {
+              var zA = parseInt(window.getComputedStyle(a).zIndex || '0', 10) || 0;
+              var zB = parseInt(window.getComputedStyle(b).zIndex || '0', 10) || 0;
+              return zB - zA;
+            });
+            if (navButtons.length > 0) {
+              var chosen = navButtons[0];
+              var chosenText = (chosen.textContent || '').trim();
+              var chosenZ = parseInt(window.getComputedStyle(chosen).zIndex || '0', 10) || 0;
+              chosen.click();
+              return 'Auto-skipped drag via nav: ' + chosenText + ' (z-index: ' + chosenZ + ')';
+            }
+            return 'Auto-skip failed: no nav buttons found';
+          })()`
+        );
+        snapshot = preScanSkipResult.snapshot;
+        lastChangesSummary = preScanSkipResult.changes.summary;
+
+        var preScanSkipText =
+          typeof preScanSkipResult.result === 'string'
+            ? preScanSkipResult.result
+            : JSON.stringify(preScanSkipResult.result ?? null);
+
+        logAgent('Pre-scan detected drag-and-drop. Auto-skipped.');
+        logAgent(`Pre-scan auto-skip result for step ${stepNumber}: ${truncate(preScanSkipText, 180)}`);
+        appendPriorityDirective(
+          `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) and auto-skipped via nav.`
+        );
+        messages.push({
+          role: 'user',
+          parts: [{ text: `<status>Pre-scan detected drag-and-drop. Auto-skipped. (${truncate(preScanSkipText, 120)})</status>` }]
+        });
+
+        var preScanObservedStep = detectVisibleStep(snapshot);
+        if (preScanObservedStep && preScanObservedStep > lastVisibleStep) {
+          sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, preScanObservedStep - 1, maxSteps);
+          completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
+          lastVisibleStep = preScanObservedStep;
+        }
+
+        codeSubmittedThisStep = false;
+        stepToolCalls = 0;
+        stuckEscalationSent = false;
+        stuckCyclesOnStep = 0;
+        stuckCyclesStep = null;
+        hardSkipFailCount = 0;
+        lastHardSkipStep = -1;
+        noOpWindow = [];
+        stepStartVisibleStep = lastVisibleStep;
+        stepStartTimeMs = Date.now();
+        return true;
+      }
+
       var hiddenObject =
         rootObject.hidden && typeof rootObject.hidden === 'object'
           ? (rootObject.hidden as Record<string, unknown>)
@@ -1048,10 +1142,6 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
       var preScanCode = hiddenCode ?? clickRevealCode;
       var preScanSource = hiddenCode ? hiddenSource : clickRevealCode ? clickRevealSource : 'not-found';
-      var clearedCount =
-        typeof clearObject.cleared === 'number' && Number.isFinite(clearObject.cleared)
-          ? Math.max(0, Math.floor(clearObject.cleared))
-          : 0;
 
       var hiddenCodeText = hiddenCode ? `'${hiddenCode}'` : 'null';
       var clickCodeText = clickRevealCode ? `'${clickRevealCode}'` : 'null';
@@ -1068,11 +1158,13 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       logAgent(
         `Pre-scan completed for step ${stepNumber}: clear=${clearedCount} hidden=${hiddenCode ?? 'null'}(${hiddenSource}) clickReveal=${clickRevealCode ?? 'null'}(${clickRevealSource})`
       );
+      return false;
     } catch (error) {
       appendPriorityDirective(
         "Pre-scan results: __clearOverlays(), __solveHiddenDOM(), and __solveClickReveal failed with pre-scan-error. The code is not in standard DOM locations yet. Try other approaches."
       );
       logAgent(`Pre-scan failed for step ${stepNumber}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   };
 
@@ -1250,7 +1342,12 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     }
 
     if (currentStep !== lastPreScannedStep) {
-      await runHiddenDomPreScan(currentStep);
+      var preScanAdvanced = await runHiddenDomPreScan(currentStep);
+      if (preScanAdvanced) {
+        lastPreScannedStep = null;
+        messages = trimConversation(messages);
+        continue;
+      }
       lastPreScannedStep = currentStep;
     }
 
