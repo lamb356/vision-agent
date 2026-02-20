@@ -512,7 +512,7 @@ function forceAdvanceStepCode(targetStep: number): string {
 async function installHiddenDomHelper(page: Page): Promise<void> {
   try {
     await page.evaluate(`(function(){
-      if (window.__solveHiddenDOM && window.__findHoverTargets) {
+      if (window.__solveHiddenDOM && window.__findHoverTargets && window.__solveClickReveal && window.__clearOverlays) {
         return 'exists';
       }
 
@@ -537,6 +537,192 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
         }
         return null;
       }
+
+      function collectCodesInSubtree(root) {
+        var found = [];
+        var seen = {};
+        if (!root) {
+          return found;
+        }
+
+        try {
+          var textWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+          var textNode = null;
+          while ((textNode = textWalker.nextNode())) {
+            var textMatches = String(textNode.nodeValue || '').toUpperCase().match(/\\b[A-Z0-9]{6}\\b/g) || [];
+            for (var i = 0; i < textMatches.length; i += 1) {
+              var textCode = normalizeCandidate(textMatches[i]);
+              if (textCode && !seen[textCode]) {
+                seen[textCode] = true;
+                found.push(textCode);
+              }
+            }
+          }
+        } catch (_) {
+          // Ignore TreeWalker errors and keep scanning attributes.
+        }
+
+        try {
+          var elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+          for (var j = 0; j < elements.length; j += 1) {
+            var el = elements[j];
+            for (var k = 0; k < el.attributes.length; k += 1) {
+              var attrValue = String(el.attributes[k].value || '').toUpperCase();
+              var attrMatches = attrValue.match(/\\b[A-Z0-9]{6}\\b/g) || [];
+              for (var m = 0; m < attrMatches.length; m += 1) {
+                var attrCode = normalizeCandidate(attrMatches[m]);
+                if (attrCode && !seen[attrCode]) {
+                  seen[attrCode] = true;
+                  found.push(attrCode);
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // Ignore attribute scan errors.
+        }
+
+        return found;
+      }
+
+      function ownTextIncludesClickHere(el) {
+        if (!el || !el.childNodes) {
+          return false;
+        }
+        var ownText = '';
+        for (var i = 0; i < el.childNodes.length; i += 1) {
+          var node = el.childNodes[i];
+          if (node && node.nodeType === 3) {
+            ownText += String(node.nodeValue || '') + ' ';
+          }
+        }
+        return ownText.toLowerCase().indexOf('click here') !== -1;
+      }
+
+      function elementDepth(el) {
+        var depth = 0;
+        while (el) {
+          depth += 1;
+          el = el.parentElement;
+        }
+        return depth;
+      }
+
+      window.__clearOverlays = function() {
+        var patterns = [
+          'cookie consent',
+          'newsletter',
+          'amazing deals',
+          'won a prize',
+          'warning',
+          'alert',
+          'important notice',
+          'overlay notice',
+          'modal dialog',
+          'popup message',
+          'limited time offer',
+          'subscribe',
+          'dismiss'
+        ];
+        var cleared = 0;
+        var overlays = document.querySelectorAll('div.fixed');
+        for (var i = 0; i < overlays.length; i += 1) {
+          var el = overlays[i];
+          var text = String(el.textContent || '').toLowerCase();
+          var match = false;
+          for (var j = 0; j < patterns.length; j += 1) {
+            if (text.indexOf(patterns[j]) !== -1) {
+              match = true;
+              break;
+            }
+          }
+          if (match) {
+            el.style.display = 'none';
+            el.style.pointerEvents = 'none';
+            cleared += 1;
+          }
+        }
+        return { cleared: cleared };
+      };
+
+      window.__solveClickReveal = function() {
+        if (!document.body) {
+          return { code: null, source: 'click-reveal-not-found' };
+        }
+
+        var baselineBodyCodes = collectCodesInSubtree(document.body);
+        var targets = [];
+        var seenTargets = [];
+
+        try {
+          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+          var textNode = null;
+          while ((textNode = walker.nextNode())) {
+            var textValue = String(textNode.nodeValue || '').trim().toLowerCase();
+            if (textValue.indexOf('click here') === -1) {
+              continue;
+            }
+            var parent = textNode.parentElement;
+            if (!parent || !parent.isConnected) {
+              continue;
+            }
+            if (!ownTextIncludesClickHere(parent)) {
+              continue;
+            }
+            if (seenTargets.indexOf(parent) !== -1) {
+              continue;
+            }
+            seenTargets.push(parent);
+            targets.push(parent);
+          }
+        } catch (_) {
+          // If TreeWalker fails, continue with no targets.
+        }
+
+        if (!targets.length) {
+          return { code: null, source: 'click-reveal-not-found' };
+        }
+
+        targets.sort(function(a, b) {
+          return elementDepth(b) - elementDepth(a);
+        });
+
+        for (var i = 0; i < targets.length; i += 1) {
+          var target = targets[i];
+          var surrounding =
+            target.closest('p, span, div, strong, em, a, li, section, article') || target.parentElement || document.body;
+          var beforeCodes = collectCodesInSubtree(surrounding);
+
+          for (var c = 0; c < 10; c += 1) {
+            try {
+              target.click();
+            } catch (_) {
+              // Ignore click errors.
+            }
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }
+
+          var afterCodes = collectCodesInSubtree(surrounding);
+          for (var a = 0; a < afterCodes.length; a += 1) {
+            if (beforeCodes.indexOf(afterCodes[a]) === -1) {
+              return {
+                code: afterCodes[a],
+                source: 'click-reveal',
+                targetText: String(target.textContent || '').trim().slice(0, 120)
+              };
+            }
+          }
+        }
+
+        var finalBodyCodes = collectCodesInSubtree(document.body);
+        for (var f = 0; f < finalBodyCodes.length; f += 1) {
+          if (baselineBodyCodes.indexOf(finalBodyCodes[f]) === -1) {
+            return { code: finalBodyCodes[f], source: 'click-reveal' };
+          }
+        }
+
+        return { code: null, source: 'click-reveal-not-found' };
+      };
 
       window.__solveHiddenDOM = function() {
         var pageText = String(document.body && document.body.innerText ? document.body.innerText : '');
@@ -811,36 +997,80 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
   var runHiddenDomPreScan = async (stepNumber: number): Promise<void> => {
     try {
       var preScanResult = await page.evaluate(`(() => {
-        if (!window.__solveHiddenDOM) {
-          return { code: null, source: 'helper-missing' };
-        }
-        return window.__solveHiddenDOM();
+        var clearResult =
+          typeof window.__clearOverlays === 'function'
+            ? window.__clearOverlays()
+            : { cleared: 0, source: 'clear-helper-missing' };
+        var hiddenResult =
+          typeof window.__solveHiddenDOM === 'function'
+            ? window.__solveHiddenDOM()
+            : { code: null, source: 'hidden-helper-missing' };
+        var clickRevealResult =
+          typeof window.__solveClickReveal === 'function'
+            ? window.__solveClickReveal()
+            : { code: null, source: 'click-helper-missing' };
+        return {
+          clear: clearResult,
+          hidden: hiddenResult,
+          clickReveal: clickRevealResult
+        };
       })()`);
 
-      var resultObject =
+      var rootObject =
         preScanResult && typeof preScanResult === 'object'
           ? (preScanResult as Record<string, unknown>)
-          : ({ code: null, source: 'invalid-result' } as Record<string, unknown>);
+          : ({ clear: { cleared: 0 }, hidden: { code: null, source: 'invalid-result' }, clickReveal: { code: null, source: 'invalid-result' } } as Record<string, unknown>);
 
-      var preScanCode =
-        typeof resultObject.code === 'string' && /^[A-Z0-9]{6}$/.test(resultObject.code)
-          ? resultObject.code
+      var clearObject =
+        rootObject.clear && typeof rootObject.clear === 'object'
+          ? (rootObject.clear as Record<string, unknown>)
+          : ({ cleared: 0 } as Record<string, unknown>);
+      var hiddenObject =
+        rootObject.hidden && typeof rootObject.hidden === 'object'
+          ? (rootObject.hidden as Record<string, unknown>)
+          : ({ code: null, source: 'invalid-hidden' } as Record<string, unknown>);
+      var clickRevealObject =
+        rootObject.clickReveal && typeof rootObject.clickReveal === 'object'
+          ? (rootObject.clickReveal as Record<string, unknown>)
+          : ({ code: null, source: 'invalid-click' } as Record<string, unknown>);
+
+      var hiddenCode =
+        typeof hiddenObject.code === 'string' && /^[A-Z0-9]{6}$/.test(hiddenObject.code)
+          ? hiddenObject.code
           : null;
-      var preScanSource = typeof resultObject.source === 'string' ? resultObject.source : 'unknown';
+      var hiddenSource = typeof hiddenObject.source === 'string' ? hiddenObject.source : 'unknown';
+
+      var clickRevealCode =
+        typeof clickRevealObject.code === 'string' && /^[A-Z0-9]{6}$/.test(clickRevealObject.code)
+          ? clickRevealObject.code
+          : null;
+      var clickRevealSource = typeof clickRevealObject.source === 'string' ? clickRevealObject.source : 'unknown';
+
+      var preScanCode = hiddenCode ?? clickRevealCode;
+      var preScanSource = hiddenCode ? hiddenSource : clickRevealCode ? clickRevealSource : 'not-found';
+      var clearedCount =
+        typeof clearObject.cleared === 'number' && Number.isFinite(clearObject.cleared)
+          ? Math.max(0, Math.floor(clearObject.cleared))
+          : 0;
+
+      var hiddenCodeText = hiddenCode ? `'${hiddenCode}'` : 'null';
+      var clickCodeText = clickRevealCode ? `'${clickRevealCode}'` : 'null';
 
       if (preScanCode) {
         appendPriorityDirective(
-          `Pre-scan result: __solveHiddenDOM() returned {code: '${preScanCode}', source: '${preScanSource}'}. You may submit this code or investigate further.`
+          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveHiddenDOM() returned {code: ${hiddenCodeText}, source: '${hiddenSource}'}. __solveClickReveal() returned {code: ${clickCodeText}, source: '${clickRevealSource}'}. Candidate code '${preScanCode}' from '${preScanSource}'. You may submit this code or investigate further.`
         );
       } else {
         appendPriorityDirective(
-          `Pre-scan result: __solveHiddenDOM() returned {code: null, source: '${preScanSource}'}. The code is not in standard DOM locations. Try other approaches.`
+          `Pre-scan results: __clearOverlays() cleared ${clearedCount} elements. __solveHiddenDOM() returned {code: null, source: '${hiddenSource}'}. __solveClickReveal() returned {code: null, source: '${clickRevealSource}'}. The code is not in standard DOM locations yet. Try other approaches.`
         );
       }
-      logAgent(`Pre-scan completed for step ${stepNumber}: code=${preScanCode ?? 'null'} source=${preScanSource}`);
+      logAgent(
+        `Pre-scan completed for step ${stepNumber}: clear=${clearedCount} hidden=${hiddenCode ?? 'null'}(${hiddenSource}) clickReveal=${clickRevealCode ?? 'null'}(${clickRevealSource})`
+      );
     } catch (error) {
       appendPriorityDirective(
-        "Pre-scan result: __solveHiddenDOM() returned {code: null, source: 'pre-scan-error'}. The code is not in standard DOM locations. Try other approaches."
+        "Pre-scan results: __clearOverlays(), __solveHiddenDOM(), and __solveClickReveal failed with pre-scan-error. The code is not in standard DOM locations yet. Try other approaches."
       );
       logAgent(`Pre-scan failed for step ${stepNumber}: ${error instanceof Error ? error.message : String(error)}`);
     }
