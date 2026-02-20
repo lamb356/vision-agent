@@ -94,7 +94,7 @@ export async function callGemini(
     })),
     generationConfig: {
       temperature: options.temperature ?? 0.2,
-      maxOutputTokens: options.maxTokens ?? 2048,
+      maxOutputTokens: options.maxTokens ?? 600,
       ...(typeof options.thinkingBudget === 'number'
         ? { thinkingConfig: { thinkingBudget: options.thinkingBudget } }
         : {})

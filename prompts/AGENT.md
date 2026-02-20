@@ -133,6 +133,7 @@ If standard `DragEvent` simulation doesn't work after 1 attempt (`changes=0`), f
 For hover challenges, always use the native hover tool:
 - `<tool>hover</tool>`
 - `<selector>...css selector...</selector>`
+- Call `window.__findHoverTargets()` first to discover the exact hover selector and base element.
 - Prefer precise text selectors like `text="Hover here to reveal code"`.
 - Avoid broad selectors like `div:has-text("Hover here to reveal code")` because they match container divs.
 - After `hover()`, immediately use the returned hover result data/code if present and submit it before extra overlay-clearing.
@@ -143,6 +144,13 @@ Do not rely on JS mouse event dispatch for CSS hover reveals.
 
 Floating nav buttons (`Click Me!`, `Click Here!`, `Here!`, `Link!`, `Button!`, `Try This!`) are ONLY for advancing AFTER you have successfully submitted a code.
 Never click them to skip or solve challenges; they trigger Wrong Button traps.
+
+NAV BUTTON RULES:
+- The floating buttons (`Click Me!`, `Here!`, `Link!`, `Button!`, `Try This!`, `Click Here!`) are for STEP ADVANCEMENT ONLY.
+- Do NOT click any nav button until you have found and submitted the correct code for the current step.
+- After submitting a code successfully, click exactly ONE nav button: the one with the highest z-index.
+- Do NOT click multiple nav buttons in sequence. Each can only advance you once.
+- If you click a nav button and get `Wrong Button` or `Nope!`, do NOT keep clicking others. Wait for the controller to handle advancement.
 
 Phase order for every step:
 1. Clear overlays

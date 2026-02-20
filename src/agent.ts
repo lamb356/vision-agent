@@ -512,11 +512,49 @@ function forceAdvanceStepCode(targetStep: number): string {
 async function installHiddenDomHelper(page: Page): Promise<void> {
   try {
     await page.evaluate(`(function(){
-      if (window.__solveHiddenDOM) {
+      if (window.__solveHiddenDOM && window.__findHoverTargets) {
         return 'exists';
       }
 
+      var CODE_EXACT = /^[A-Z0-9]{6}$/;
+      var CODE_ANY = /\\b([A-Z0-9]{6})\\b/;
+
+      function normalizeCandidate(value) {
+        var cleaned = String(value || '').replace(/['"]/g, '').trim().toUpperCase();
+        if (CODE_EXACT.test(cleaned)) {
+          return cleaned;
+        }
+        return null;
+      }
+
+      function extractAnyCode(value) {
+        var text = String(value || '').toUpperCase();
+        var match = text.match(CODE_ANY);
+        if (!match || !match[1]) {
+          return null;
+        }
+        var normalized = normalizeCandidate(match[1]);
+        return normalized;
+      }
+
+      function maybeDecodeBase64(value) {
+        var text = String(value || '').trim();
+        if (!text || text.length < 8 || text.length % 4 !== 0) {
+          return null;
+        }
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
+          return null;
+        }
+        try {
+          return atob(text);
+        } catch (_) {
+          return null;
+        }
+      }
+
       window.__solveHiddenDOM = function() {
+        var pageText = String(document.body && document.body.innerText ? document.body.innerText : '');
+        var hiddenDomContext = /hidden\\s*dom\\s*challenge/i.test(pageText);
         var candidates = Array.from(document.querySelectorAll('p, span, div, strong, em, a'));
         var clickTarget = candidates.find(function(el) {
           var t = (el.textContent || '').trim().toLowerCase();
@@ -534,7 +572,7 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           clickTarget = fallbackCandidates[0] || null;
         }
 
-        if (clickTarget) {
+        if (hiddenDomContext && clickTarget) {
           var match = (clickTarget.textContent || '').match(/(\\d+)\\s*more\\s*time/i);
           var clicks = match ? parseInt(match[1], 10) + 2 : 10;
           if (!Number.isFinite(clicks) || clicks < 1) {
@@ -545,51 +583,188 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           }
         }
 
-        var codeRegex = /^[A-Z0-9]{6}$/;
         var allEls = document.querySelectorAll('*');
+
+        // 1) Scan data-* and ALL attributes on every element.
         for (var i = 0; i < allEls.length; i += 1) {
           var el = allEls[i];
           for (var j = 0; j < el.attributes.length; j += 1) {
             var attr = el.attributes[j];
             var value = (attr.value || '').trim();
-            if (codeRegex.test(value)) {
-              return { code: value, source: 'attr', tag: el.tagName, attr: attr.name };
+            var attrCode = normalizeCandidate(value);
+            if (attrCode) {
+              return { code: attrCode, source: 'attr:' + attr.name, tag: el.tagName, attr: attr.name };
             }
           }
         }
 
+        // 2) Scan CSS pseudo-element computed content.
         for (var i = 0; i < allEls.length; i += 1) {
           var el = allEls[i];
-          var before = window.getComputedStyle(el, '::before').content;
-          var after = window.getComputedStyle(el, '::after').content;
+          var before = '';
+          var after = '';
+          try {
+            before = window.getComputedStyle(el, '::before').content;
+            after = window.getComputedStyle(el, '::after').content;
+          } catch (_) {}
           var contents = [before, after];
           for (var k = 0; k < contents.length; k += 1) {
             var c = contents[k];
-            if (c && c !== 'none') {
-              var cleaned = c.replace(/['"]/g, '').trim();
-              if (codeRegex.test(cleaned)) {
-                return { code: cleaned, source: 'css-content' };
-              }
+            if (!c || c === 'none' || c === 'normal') {
+              continue;
+            }
+            var pseudoCode = normalizeCandidate(c);
+            if (pseudoCode) {
+              return { code: pseudoCode, source: k === 0 ? 'css-::before' : 'css-::after' };
             }
           }
         }
 
-        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
-        while (walker.nextNode()) {
-          var nodeText = walker.currentNode && walker.currentNode.textContent ? walker.currentNode.textContent : '';
-          var commentMatch = nodeText.match(/[A-Z0-9]{6}/);
-          if (commentMatch) {
-            return { code: commentMatch[0], source: 'comment' };
+        // 3) Scan inline style properties.
+        for (var i = 0; i < allEls.length; i += 1) {
+          var inlineStyle = allEls[i].getAttribute('style') || '';
+          var styleCode = extractAnyCode(inlineStyle);
+          if (styleCode) {
+            return { code: styleCode, source: 'inline-style' };
           }
         }
 
-        var bodyText = document.body && document.body.innerText ? document.body.innerText : '';
-        var codes = bodyText.match(/\\b[A-Z0-9]{6}\\b/g) || [];
-        if (codes.length > 0) {
-          return { code: codes[codes.length - 1], source: 'text' };
+        // 4) Scan HTML comments.
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+        while (walker.nextNode()) {
+          var nodeText = walker.currentNode && walker.currentNode.textContent ? walker.currentNode.textContent : '';
+          var commentCode = extractAnyCode(nodeText);
+          if (commentCode) {
+            return { code: commentCode, source: 'comment' };
+          }
+        }
+
+        // 5) Scan inline script contents.
+        var scripts = document.querySelectorAll('script:not([src])');
+        for (var i = 0; i < scripts.length; i += 1) {
+          var scriptText = scripts[i].textContent || '';
+          var quotedMatch = scriptText.match(/['"]([A-Z0-9]{6})['"]/);
+          if (quotedMatch && quotedMatch[1] && CODE_EXACT.test(quotedMatch[1])) {
+            return { code: quotedMatch[1], source: 'script-tag' };
+          }
+          var scriptCode = extractAnyCode(scriptText);
+          if (scriptCode) {
+            return { code: scriptCode, source: 'script-tag' };
+          }
+        }
+
+        // 6) Scan meta tag content attributes.
+        var metas = document.querySelectorAll('meta[content]');
+        for (var i = 0; i < metas.length; i += 1) {
+          var metaCode = extractAnyCode(metas[i].getAttribute('content') || '');
+          if (metaCode) {
+            return { code: metaCode, source: 'meta-content' };
+          }
+        }
+
+        // 7) Try Base64-decoding attribute values.
+        for (var i = 0; i < allEls.length; i += 1) {
+          var el = allEls[i];
+          for (var j = 0; j < el.attributes.length; j += 1) {
+            var attr = el.attributes[j];
+            var decoded = maybeDecodeBase64(attr.value || '');
+            if (!decoded) {
+              continue;
+            }
+            var decodedCode = extractAnyCode(decoded);
+            if (decodedCode) {
+              return { code: decodedCode, source: 'base64-attr:' + attr.name, tag: el.tagName, attr: attr.name };
+            }
+          }
+        }
+
+        // 8) Scan open shadow DOM roots.
+        for (var i = 0; i < allEls.length; i += 1) {
+          var host = allEls[i];
+          if (!host.shadowRoot) {
+            continue;
+          }
+          var shadowText = String(host.shadowRoot.innerHTML || '') + ' ' + String(host.shadowRoot.textContent || '');
+          var shadowCode = extractAnyCode(shadowText);
+          if (shadowCode) {
+            return { code: shadowCode, source: 'shadow-dom', tag: host.tagName };
+          }
+        }
+
+        // 9) Visible text scan as a final fallback.
+        var visibleTextCode = extractAnyCode(pageText);
+        if (visibleTextCode) {
+          return { code: visibleTextCode, source: 'visible-text' };
         }
 
         return { code: null, source: 'not-found' };
+      };
+
+      window.__findHoverTargets = function() {
+        var targets = [];
+        var seen = {};
+
+        function addTarget(selectorText, cssText) {
+          if (!selectorText || selectorText.indexOf(':hover') === -1) {
+            return;
+          }
+          var baseSelector = selectorText.replace(/:hover[\\s\\S]*$/, '').trim();
+          if (!baseSelector) {
+            baseSelector = selectorText.trim();
+          }
+          var key = selectorText + '|' + baseSelector;
+          if (seen[key]) {
+            return;
+          }
+          seen[key] = true;
+          targets.push({
+            hoverSelector: selectorText.trim(),
+            baseSelector: baseSelector,
+            cssProperties: (cssText || '').trim()
+          });
+        }
+
+        function inspectRule(rule) {
+          if (!rule) {
+            return;
+          }
+
+          if (rule.selectorText && rule.selectorText.indexOf(':hover') !== -1) {
+            var cssText = rule.style ? String(rule.style.cssText || '') : '';
+            var lowered = cssText.toLowerCase();
+            var relevant =
+              lowered.indexOf('content') !== -1 ||
+              lowered.indexOf('display') !== -1 ||
+              lowered.indexOf('visibility') !== -1 ||
+              lowered.indexOf('opacity') !== -1;
+
+            if (relevant) {
+              addTarget(rule.selectorText, cssText);
+            }
+          }
+
+          var nested = rule.cssRules;
+          if (nested && nested.length) {
+            for (var i = 0; i < nested.length; i += 1) {
+              inspectRule(nested[i]);
+            }
+          }
+        }
+
+        var sheets = document.styleSheets || [];
+        for (var i = 0; i < sheets.length; i += 1) {
+          var sheet = sheets[i];
+          try {
+            var rules = sheet.cssRules || [];
+            for (var j = 0; j < rules.length; j += 1) {
+              inspectRule(rules[j]);
+            }
+          } catch (_) {
+            // Ignore cross-origin stylesheet access errors.
+          }
+        }
+
+        return targets;
       };
 
       return 'installed';
@@ -635,11 +810,23 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
   var visibleStep = detectVisibleStep(snapshot) ?? 1;
   var lastVisibleStep = visibleStep;
-  var completedSteps = Math.max(0, lastVisibleStep - 1);
+  var sessionCompletedSteps = Math.max(0, lastVisibleStep - 1);
+  var completedSteps = sessionCompletedSteps;
   var stepStartVisibleStep = lastVisibleStep;
   var stepStartTimeMs = Date.now();
+  var lastPreScannedStep: number | null = null;
 
-  logAgent(`Initial visible step: ${lastVisibleStep}; completed estimate: ${completedSteps}/${maxSteps}`);
+  logAgent(`Initial visible step: ${lastVisibleStep}; completed estimate: ${sessionCompletedSteps}/${maxSteps}`);
+
+  var appendPriorityDirective = (directive: string): void => {
+    var trimmed = directive.trim();
+    if (!trimmed) {
+      return;
+    }
+    pendingPriorityDirective = pendingPriorityDirective
+      ? `${pendingPriorityDirective}\n${trimmed}`
+      : trimmed;
+  };
 
   var maybeTriggerNoOpCircuitBreaker = async (): Promise<void> => {
     if (noOpWindow.length < 3) {
@@ -671,7 +858,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       ]
     });
 
-    pendingPriorityDirective = directive;
+    appendPriorityDirective(directive);
     lastChangesSummary = '(no-op circuit breaker screenshot captured)';
     noOpWindow = [];
   };
@@ -693,7 +880,9 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     snapshot = restartResult.snapshot;
     lastChangesSummary = restartResult.changes.summary;
     await installHiddenDomHelper(page);
-    lastVisibleStep = detectVisibleStep(snapshot) ?? lastVisibleStep;
+    lastVisibleStep = detectVisibleStep(snapshot) ?? 1;
+    sessionCompletedSteps = 0;
+    completedSteps = setCompletedStepsMonotonic(completedSteps, Math.max(0, lastVisibleStep - 1), maxSteps);
 
     stepToolCalls = 0;
     stuckEscalationSent = false;
@@ -705,8 +894,10 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     noOpWindow = [];
     stepStartVisibleStep = lastVisibleStep;
     stepStartTimeMs = Date.now();
-    pendingPriorityDirective =
-      'Controller recovered from a 404 page. Continue solving from the current visible step and do not use history navigation.';
+    lastPreScannedStep = null;
+    appendPriorityDirective(
+      'Controller recovered from a 404 page. Continue solving from the current visible step and do not use history navigation.'
+    );
 
     messages.push({
       role: 'user',
@@ -715,6 +906,44 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
     logAgent('Recovered from 404, restarted from base URL');
     return true;
+  };
+
+  var runHiddenDomPreScan = async (stepNumber: number): Promise<void> => {
+    try {
+      var preScanResult = await page.evaluate(`(() => {
+        if (!window.__solveHiddenDOM) {
+          return { code: null, source: 'helper-missing' };
+        }
+        return window.__solveHiddenDOM();
+      })()`);
+
+      var resultObject =
+        preScanResult && typeof preScanResult === 'object'
+          ? (preScanResult as Record<string, unknown>)
+          : ({ code: null, source: 'invalid-result' } as Record<string, unknown>);
+
+      var preScanCode =
+        typeof resultObject.code === 'string' && /^[A-Z0-9]{6}$/.test(resultObject.code)
+          ? resultObject.code
+          : null;
+      var preScanSource = typeof resultObject.source === 'string' ? resultObject.source : 'unknown';
+
+      if (preScanCode) {
+        appendPriorityDirective(
+          `Pre-scan result: __solveHiddenDOM() returned {code: '${preScanCode}', source: '${preScanSource}'}. You may submit this code or investigate further.`
+        );
+      } else {
+        appendPriorityDirective(
+          `Pre-scan result: __solveHiddenDOM() returned {code: null, source: '${preScanSource}'}. The code is not in standard DOM locations. Try other approaches.`
+        );
+      }
+      logAgent(`Pre-scan completed for step ${stepNumber}: code=${preScanCode ?? 'null'} source=${preScanSource}`);
+    } catch (error) {
+      appendPriorityDirective(
+        "Pre-scan result: __solveHiddenDOM() returned {code: null, source: 'pre-scan-error'}. The code is not in standard DOM locations. Try other approaches."
+      );
+      logAgent(`Pre-scan failed for step ${stepNumber}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   var performHardSkip = async (cycleStep: number, reason: string): Promise<void> => {
@@ -748,7 +977,8 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
       var forceObservedStep = detectVisibleStepFromPageText(snapshot);
       if (forceObservedStep && forceObservedStep > hardSkipBaseStep) {
-        completedSteps = setCompletedStepsMonotonic(completedSteps, forceObservedStep - 1, maxSteps);
+        sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, forceObservedStep - 1, maxSteps);
+        completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
         lastVisibleStep = forceObservedStep;
         hardSkipHandled = true;
 
@@ -795,7 +1025,8 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
         var navObservedStep = detectVisibleStepFromPageText(snapshot);
         if (navObservedStep && navObservedStep > hardSkipBaseStep) {
-          completedSteps = setCompletedStepsMonotonic(completedSteps, navObservedStep - 1, maxSteps);
+          sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, navObservedStep - 1, maxSteps);
+          completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
           lastVisibleStep = navObservedStep;
           hardSkipHandled = true;
 
@@ -826,13 +1057,9 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
           lastChangesSummary = hardSkipResetResult.changes.summary;
           await installHiddenDomHelper(page);
 
-          completedSteps = setCompletedStepsMonotonic(completedSteps, cycleStep, maxSteps);
-          var resetObservedStep = detectVisibleStep(snapshot);
-          if (resetObservedStep) {
-            lastVisibleStep = resetObservedStep;
-          } else {
-            lastVisibleStep = Math.max(1, lastVisibleStep);
-          }
+          sessionCompletedSteps = 0;
+          lastVisibleStep = detectVisibleStep(snapshot) ?? 1;
+          completedSteps = setCompletedStepsMonotonic(completedSteps, Math.max(0, lastVisibleStep - 1), maxSteps);
 
           messages.push({
             role: 'user',
@@ -859,6 +1086,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       noOpWindow = [];
       stepStartVisibleStep = lastVisibleStep;
       stepStartTimeMs = Date.now();
+      lastPreScannedStep = null;
     } catch (error) {
       logAgent(`HARD SKIP failed: ${error instanceof Error ? error.message : String(error)}`);
       stepToolCalls = 0;
@@ -868,16 +1096,17 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       codeSubmittedThisStep = false;
       stepStartVisibleStep = lastVisibleStep;
       stepStartTimeMs = Date.now();
+      lastPreScannedStep = null;
     }
   };
 
-  while (completedSteps < maxSteps && toolCalls < maxToolCalls) {
+  while (sessionCompletedSteps < maxSteps && toolCalls < maxToolCalls) {
     var elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
     if (elapsedSeconds > 295) {
       logAgent('Stopping due to 5-minute time budget threshold.');
       break;
     }
-    var currentStep = Math.max(1, Math.max(lastVisibleStep, completedSteps + 1));
+    var currentStep = Math.max(1, lastVisibleStep);
 
     if (currentStep !== stepStartVisibleStep) {
       stepStartVisibleStep = currentStep;
@@ -890,6 +1119,11 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       continue;
     }
 
+    if (currentStep !== lastPreScannedStep) {
+      await runHiddenDomPreScan(currentStep);
+      lastPreScannedStep = currentStep;
+    }
+
     var navGuidance = codeSubmittedThisStep
       ? 'Code was submitted. Click the highest z-index nav button to advance.'
       : 'Do NOT click floating nav buttons yet. Find and submit the code first.';
@@ -898,7 +1132,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
     var stateMessage = formatSnapshotForModel(snapshot, {
       currentStep,
-      completedSteps,
+      completedSteps: sessionCompletedSteps,
       maxSteps,
       toolCalls,
       maxToolCalls,
@@ -912,10 +1146,11 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
     var modelResponse = '';
     try {
+      var isStuckBudget = stepToolCalls >= 4;
       modelResponse = await callGemini(messages, agentPrompt, process.env.GEMINI_MODEL, {
         temperature: 0.15,
-        maxTokens: 1600,
-        thinkingBudget: 384
+        maxTokens: isStuckBudget ? 800 : 600,
+        thinkingBudget: isStuckBudget ? 256 : 128
       });
       consecutiveModelFailures = 0;
     } catch (error) {
@@ -969,7 +1204,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
           role: 'user',
           parts: [{ text: 'The last JS pattern is banned due to repeated zero-effect actions. Use a completely different approach.' }]
         });
-        pendingPriorityDirective = 'Your previous code pattern is banned due to no-op repetition. Use a different strategy.';
+        appendPriorityDirective('Your previous code pattern is banned due to no-op repetition. Use a different strategy.');
         messages = trimConversation(messages);
         continue;
       }
@@ -1122,10 +1357,12 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     }
 
     var observedStep = detectVisibleStep(snapshot);
+    var advancedStepThisTurn = false;
     if (observedStep && observedStep > lastVisibleStep) {
-      var gained = observedStep - lastVisibleStep;
-      completedSteps = setCompletedStepsMonotonic(completedSteps, completedSteps + gained, maxSteps);
+      sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, observedStep - 1, maxSteps);
+      completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
       lastVisibleStep = observedStep;
+      advancedStepThisTurn = true;
       stepToolCalls = 0;
       stuckEscalationSent = false;
       stuckCyclesOnStep = 0;
@@ -1135,21 +1372,22 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       pendingPriorityDirective = null;
       stepStartVisibleStep = observedStep;
       stepStartTimeMs = Date.now();
-      logAgent(`Step advanced to visible step ${observedStep}. Completed estimate: ${completedSteps}/${maxSteps}`);
+      lastPreScannedStep = null;
+      logAgent(`Step advanced to visible step ${observedStep}. Completed estimate: ${sessionCompletedSteps}/${maxSteps}`);
 
       messages.push({
         role: 'user',
-        parts: [{ text: `<status>Detected step advancement. Completed ${completedSteps}/${maxSteps}.</status>` }]
+        parts: [{ text: `<status>Detected step advancement. Completed ${sessionCompletedSteps}/${maxSteps}.</status>` }]
       });
 
       if (messages.length > 4) {
-        var summary = `Completed steps 1-${completedSteps}. Now on step ${observedStep}.`;
+        var summary = `Completed steps 1-${sessionCompletedSteps}. Now on step ${observedStep}.`;
         messages = messages.slice(messages.length - 4);
         messages.unshift({ role: 'user', parts: [{ text: summary }] });
       }
     }
 
-    if (!observedStep || observedStep <= lastVisibleStep) {
+    if (!advancedStepThisTurn && (!observedStep || observedStep <= lastVisibleStep)) {
       var effectiveHardSkipThreshold = codeSubmittedThisStep ? hardSkipCallThreshold + 2 : hardSkipCallThreshold;
       if (stepToolCalls >= effectiveHardSkipThreshold) {
         await performHardSkip(
@@ -1214,7 +1452,8 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
             var forceObservedStep = detectVisibleStepFromPageText(snapshot);
             if (forceObservedStep && forceObservedStep > hardSkipBaseStep) {
-              completedSteps = setCompletedStepsMonotonic(completedSteps, forceObservedStep - 1, maxSteps);
+              sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, forceObservedStep - 1, maxSteps);
+              completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
               lastVisibleStep = forceObservedStep;
               hardSkipHandled = true;
 
@@ -1260,7 +1499,8 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
               var navObservedStep = detectVisibleStepFromPageText(snapshot);
               if (navObservedStep && navObservedStep > hardSkipBaseStep) {
-                completedSteps = setCompletedStepsMonotonic(completedSteps, navObservedStep - 1, maxSteps);
+                sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, navObservedStep - 1, maxSteps);
+                completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
                 lastVisibleStep = navObservedStep;
                 hardSkipHandled = true;
 
@@ -1285,6 +1525,10 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
               var hardSkipRestart = await jsTool(page, defaultStartCode());
               snapshot = hardSkipRestart.snapshot;
               lastChangesSummary = hardSkipRestart.changes.summary;
+              lastVisibleStep = detectVisibleStep(snapshot) ?? 1;
+              sessionCompletedSteps = 0;
+              completedSteps = setCompletedStepsMonotonic(completedSteps, Math.max(0, lastVisibleStep - 1), maxSteps);
+              lastPreScannedStep = null;
 
               toolCalls += 1;
               var retryForceResult = await jsTool(page, forceAdvanceStepCode(hardSkipTargetStep));
@@ -1299,7 +1543,8 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
 
               var retryObservedStep = detectVisibleStepFromPageText(snapshot);
               if (retryObservedStep && retryObservedStep > hardSkipBaseStep) {
-                completedSteps = setCompletedStepsMonotonic(completedSteps, retryObservedStep - 1, maxSteps);
+                sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, retryObservedStep - 1, maxSteps);
+                completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
                 lastVisibleStep = retryObservedStep;
                 hardSkipHandled = true;
 
@@ -1328,6 +1573,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
             stuckCyclesOnStep = 0;
             stuckCyclesStep = null;
             noOpWindow = [];
+            lastPreScannedStep = null;
             continue;
           } catch (error) {
             logAgent(`HARD SKIP failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1335,6 +1581,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
             stuckEscalationSent = false;
             stuckCyclesOnStep = 0;
             stuckCyclesStep = null;
+            lastPreScannedStep = null;
             continue;
           }
         }
@@ -1378,6 +1625,12 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
           snapshot = restartResult.snapshot;
           toolCalls += 1;
           lastChangesSummary = restartResult.changes.summary;
+          lastVisibleStep = detectVisibleStep(snapshot) ?? 1;
+          sessionCompletedSteps = 0;
+          completedSteps = setCompletedStepsMonotonic(completedSteps, Math.max(0, lastVisibleStep - 1), maxSteps);
+          stepStartVisibleStep = lastVisibleStep;
+          stepStartTimeMs = Date.now();
+          lastPreScannedStep = null;
           logAgent('Restarted from base URL after unrecoverable state.');
         } else {
           logAgent('Recovery succeeded. Continuing without full reset.');
@@ -1386,6 +1639,7 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
         stepToolCalls = 0;
         stuckEscalationSent = false;
         noOpWindow = [];
+        lastPreScannedStep = null;
         messages.push({
           role: 'user',
           parts: [
@@ -1400,10 +1654,11 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     if (
       detectCompletion(snapshot, {
         stepCounter: currentStep,
-        completedSteps,
+        completedSteps: sessionCompletedSteps,
         visibleStep: observedStep
       })
     ) {
+      sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, maxSteps, maxSteps);
       completedSteps = setCompletedStepsMonotonic(completedSteps, maxSteps, maxSteps);
       logAgent('Completion marker detected on page.');
       break;
