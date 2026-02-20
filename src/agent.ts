@@ -517,7 +517,6 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
       }
 
       var CODE_EXACT = /^[A-Z0-9]{6}$/;
-      var CODE_ANY = /\\b([A-Z0-9]{6})\\b/;
       var SKIP_ATTRS = {
         type: true, class: true, id: true, name: true, src: true, href: true, action: true, method: true, rel: true,
         charset: true, lang: true, dir: true, style: true, role: true, tabindex: true, target: true, media: true,
@@ -537,31 +536,6 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           return cleaned;
         }
         return null;
-      }
-
-      function extractAnyCode(value) {
-        var text = String(value || '').toUpperCase();
-        var match = text.match(CODE_ANY);
-        if (!match || !match[1]) {
-          return null;
-        }
-        var normalized = normalizeCandidate(match[1]);
-        return normalized;
-      }
-
-      function maybeDecodeBase64(value) {
-        var text = String(value || '').trim();
-        if (!text || text.length < 8 || text.length % 4 !== 0) {
-          return null;
-        }
-        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
-          return null;
-        }
-        try {
-          return atob(text);
-        } catch (_) {
-          return null;
-        }
       }
 
       window.__solveHiddenDOM = function() {
@@ -597,19 +571,22 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
 
         var allEls = document.querySelectorAll('*');
 
-        // 1) Scan likely code-bearing attributes.
+        // 1) Scan only trusted attribute types.
         for (var i = 0; i < allEls.length; i += 1) {
           var el = allEls[i];
           for (var j = 0; j < el.attributes.length; j += 1) {
             var attr = el.attributes[j];
             var attrName = String(attr.name || '').toLowerCase();
+            var tagName = String(el.tagName || '').toLowerCase();
             var allowedByName =
               attrName.indexOf('data-') === 0 ||
-              attrName.indexOf('aria-') === 0 ||
-              attrName === 'title' ||
-              attrName === 'alt' ||
-              !SKIP_ATTRS[attrName];
+              attrName === 'aria-label' ||
+              attrName === 'aria-description' ||
+              (attrName === 'title' && tagName !== 'meta');
             if (!allowedByName) {
+              continue;
+            }
+            if (SKIP_ATTRS[attrName]) {
               continue;
             }
             var value = (attr.value || '').trim();
@@ -618,105 +595,6 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
               return { code: attrCode, source: 'attr:' + attr.name, tag: el.tagName, attr: attr.name };
             }
           }
-        }
-
-        // 2) Scan CSS pseudo-element computed content.
-        for (var i = 0; i < allEls.length; i += 1) {
-          var el = allEls[i];
-          var before = '';
-          var after = '';
-          try {
-            before = window.getComputedStyle(el, '::before').content;
-            after = window.getComputedStyle(el, '::after').content;
-          } catch (_) {}
-          var contents = [before, after];
-          for (var k = 0; k < contents.length; k += 1) {
-            var c = contents[k];
-            if (!c || c === 'none' || c === 'normal') {
-              continue;
-            }
-            var pseudoCode = normalizeCandidate(c);
-            if (pseudoCode) {
-              return { code: pseudoCode, source: k === 0 ? 'css-::before' : 'css-::after' };
-            }
-          }
-        }
-
-        // 3) Scan inline style properties.
-        for (var i = 0; i < allEls.length; i += 1) {
-          var inlineStyle = allEls[i].getAttribute('style') || '';
-          var styleCode = extractAnyCode(inlineStyle);
-          if (styleCode) {
-            return { code: styleCode, source: 'inline-style' };
-          }
-        }
-
-        // 4) Scan HTML comments.
-        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
-        while (walker.nextNode()) {
-          var nodeText = walker.currentNode && walker.currentNode.textContent ? walker.currentNode.textContent : '';
-          var commentCode = extractAnyCode(nodeText);
-          if (commentCode) {
-            return { code: commentCode, source: 'comment' };
-          }
-        }
-
-        // 5) Scan inline script contents.
-        var scripts = document.querySelectorAll('script:not([src])');
-        for (var i = 0; i < scripts.length; i += 1) {
-          var scriptText = scripts[i].textContent || '';
-          var quotedMatch = scriptText.match(/['"]([A-Z0-9]{6})['"]/);
-          if (quotedMatch && quotedMatch[1] && CODE_EXACT.test(quotedMatch[1])) {
-            return { code: quotedMatch[1], source: 'script-tag' };
-          }
-          var scriptCode = extractAnyCode(scriptText);
-          if (scriptCode) {
-            return { code: scriptCode, source: 'script-tag' };
-          }
-        }
-
-        // 6) Scan meta tag content attributes.
-        var metas = document.querySelectorAll('meta[content]');
-        for (var i = 0; i < metas.length; i += 1) {
-          var metaCode = extractAnyCode(metas[i].getAttribute('content') || '');
-          if (metaCode) {
-            return { code: metaCode, source: 'meta-content' };
-          }
-        }
-
-        // 7) Try Base64-decoding attribute values.
-        for (var i = 0; i < allEls.length; i += 1) {
-          var el = allEls[i];
-          for (var j = 0; j < el.attributes.length; j += 1) {
-            var attr = el.attributes[j];
-            var decoded = maybeDecodeBase64(attr.value || '');
-            if (!decoded) {
-              continue;
-            }
-            var decodedCode = extractAnyCode(decoded);
-            if (decodedCode) {
-              return { code: decodedCode, source: 'base64-attr:' + attr.name, tag: el.tagName, attr: attr.name };
-            }
-          }
-        }
-
-        // 8) Scan open shadow DOM roots.
-        for (var i = 0; i < allEls.length; i += 1) {
-          var host = allEls[i];
-          if (!host.shadowRoot) {
-            continue;
-          }
-          var shadowText = String(host.shadowRoot.innerHTML || '') + ' ' + String(host.shadowRoot.textContent || '');
-          var shadowCode = extractAnyCode(shadowText);
-          if (shadowCode) {
-            return { code: shadowCode, source: 'shadow-dom', tag: host.tagName };
-          }
-        }
-
-        // 9) Visible text scan as a final fallback.
-        var visibleTextCode = extractAnyCode(pageText);
-        if (visibleTextCode) {
-          return { code: visibleTextCode, source: 'visible-text' };
         }
 
         return { code: null, source: 'not-found' };
