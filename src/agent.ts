@@ -585,6 +585,70 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
         return found;
       }
 
+      var CLICK_REVEAL_BLOCKLIST = new Set([
+        'SUBMIT',
+        'SIGNUP',
+        'DIALOG',
+        'PLEASE',
+        'COVERS',
+        'SCROLL',
+        'BUTTON',
+        'HIDDEN',
+        'REVEAL',
+        'COOKIE',
+        'NOTICE',
+        'BROWSE',
+        'ENABLE',
+        'OPTION',
+        'SELECT',
+        'CANCEL',
+        'DELETE',
+        'SEARCH',
+        'CLOSED',
+        'RETURN',
+        'LOGGED',
+        'MANAGE',
+        'CHANGE',
+        'UPDATE',
+        'ACCEPT',
+        'REJECT',
+        'SIGNIN',
+        'LOGOUT',
+        'ALERTS',
+        'FILTER',
+        'STEP01',
+        'STEP02',
+        'STEP03',
+        'STEP04',
+        'STEP05',
+        'STEP06',
+        'STEP07',
+        'STEP08',
+        'STEP09',
+        'STEP10'
+      ]);
+
+      function collectBodyTextCodes() {
+        var found = [];
+        var seen = {};
+        if (!document.body) {
+          return found;
+        }
+        var text = String(document.body.innerText || '').toUpperCase();
+        var matches = text.match(/\\b[A-Z0-9]{6}\\b/g) || [];
+        for (var i = 0; i < matches.length; i += 1) {
+          var code = normalizeCandidate(matches[i]);
+          if (!code || CLICK_REVEAL_BLOCKLIST.has(code)) {
+            continue;
+          }
+          if (!seen[code]) {
+            seen[code] = true;
+            found.push(code);
+          }
+        }
+        return found;
+      }
+
       function ownTextIncludesClickHere(el) {
         if (!el || !el.childNodes) {
           return false;
@@ -824,7 +888,8 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           return { code: null, source: 'click-reveal-not-found' };
         }
 
-        var baselineBodyCodes = collectCodesInSubtree(document.body);
+        var preExistingList = collectBodyTextCodes();
+        var preExisting = new Set(preExistingList);
         var targets = [];
         var seenTargets = [];
 
@@ -863,15 +928,11 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
 
         for (var i = 0; i < targets.length; i += 1) {
           var target = targets[i];
-          var surrounding =
-            target.closest('p, span, div, strong, em, a, li, section, article') || target.parentElement || document.body;
-          var beforeCodes = collectCodesInSubtree(surrounding);
-
           await clickWithDelay(target, 10);
 
-          var afterCodes = collectCodesInSubtree(surrounding);
+          var afterCodes = collectBodyTextCodes();
           for (var a = 0; a < afterCodes.length; a += 1) {
-            if (beforeCodes.indexOf(afterCodes[a]) === -1) {
+            if (!preExisting.has(afterCodes[a])) {
               return {
                 code: afterCodes[a],
                 source: 'click-reveal',
@@ -881,9 +942,9 @@ async function installHiddenDomHelper(page: Page): Promise<void> {
           }
         }
 
-        var finalBodyCodes = collectCodesInSubtree(document.body);
+        var finalBodyCodes = collectBodyTextCodes();
         for (var f = 0; f < finalBodyCodes.length; f += 1) {
-          if (baselineBodyCodes.indexOf(finalBodyCodes[f]) === -1) {
+          if (!preExisting.has(finalBodyCodes[f])) {
             return { code: finalBodyCodes[f], source: 'click-reveal' };
           }
         }
