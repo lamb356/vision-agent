@@ -1003,7 +1003,9 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     return true;
   };
 
-  var runHiddenDomPreScan = async (stepNumber: number): Promise<boolean> => {
+  var runHiddenDomPreScan = async (
+    stepNumber: number
+  ): Promise<'none' | 'auto-skip-success' | 'auto-skip-failed'> => {
     try {
       var preScanResult = await page.evaluate(`(async () => {
         var clearResult =
@@ -1088,35 +1090,40 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
           typeof preScanSkipResult.result === 'string'
             ? preScanSkipResult.result
             : JSON.stringify(preScanSkipResult.result ?? null);
+        var autoSkipSucceeded = !preScanSkipText.startsWith('Auto-skip failed');
 
         logAgent('Pre-scan detected drag-and-drop. Auto-skipped.');
         logAgent(`Pre-scan auto-skip result for step ${stepNumber}: ${truncate(preScanSkipText, 180)}`);
-        appendPriorityDirective(
-          `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) and auto-skipped via nav.`
-        );
+        appendPriorityDirective(autoSkipSucceeded
+          ? `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) and auto-skipped via nav.`
+          : `Pre-scan detected drag-and-drop (draggable=${draggableCount}, cleared=${clearedCount}) but auto-skip failed. Continue normal solving flow.`);
         messages.push({
           role: 'user',
           parts: [{ text: `<status>Pre-scan detected drag-and-drop. Auto-skipped. (${truncate(preScanSkipText, 120)})</status>` }]
         });
 
-        var preScanObservedStep = detectVisibleStep(snapshot);
-        if (preScanObservedStep && preScanObservedStep > lastVisibleStep) {
-          sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, preScanObservedStep - 1, maxSteps);
-          completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
-          lastVisibleStep = preScanObservedStep;
+        if (autoSkipSucceeded) {
+          var preScanObservedStep = detectVisibleStep(snapshot);
+          if (preScanObservedStep && preScanObservedStep > lastVisibleStep) {
+            sessionCompletedSteps = setCompletedStepsMonotonic(sessionCompletedSteps, preScanObservedStep - 1, maxSteps);
+            completedSteps = setCompletedStepsMonotonic(completedSteps, sessionCompletedSteps, maxSteps);
+            lastVisibleStep = preScanObservedStep;
+          }
+
+          codeSubmittedThisStep = false;
+          stepToolCalls = 0;
+          stuckEscalationSent = false;
+          stuckCyclesOnStep = 0;
+          stuckCyclesStep = null;
+          hardSkipFailCount = 0;
+          lastHardSkipStep = -1;
+          noOpWindow = [];
+          stepStartVisibleStep = lastVisibleStep;
+          stepStartTimeMs = Date.now();
+          return 'auto-skip-success';
         }
 
-        codeSubmittedThisStep = false;
-        stepToolCalls = 0;
-        stuckEscalationSent = false;
-        stuckCyclesOnStep = 0;
-        stuckCyclesStep = null;
-        hardSkipFailCount = 0;
-        lastHardSkipStep = -1;
-        noOpWindow = [];
-        stepStartVisibleStep = lastVisibleStep;
-        stepStartTimeMs = Date.now();
-        return true;
+        return 'auto-skip-failed';
       }
 
       var hiddenObject =
@@ -1158,13 +1165,13 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
       logAgent(
         `Pre-scan completed for step ${stepNumber}: clear=${clearedCount} hidden=${hiddenCode ?? 'null'}(${hiddenSource}) clickReveal=${clickRevealCode ?? 'null'}(${clickRevealSource})`
       );
-      return false;
+      return 'none';
     } catch (error) {
       appendPriorityDirective(
         "Pre-scan results: __clearOverlays(), __solveHiddenDOM(), and __solveClickReveal failed with pre-scan-error. The code is not in standard DOM locations yet. Try other approaches."
       );
       logAgent(`Pre-scan failed for step ${stepNumber}: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
+      return 'none';
     }
   };
 
@@ -1342,13 +1349,12 @@ export async function runAgent(page: Page, options: AgentRunOptions = {}): Promi
     }
 
     if (currentStep !== lastPreScannedStep) {
-      var preScanAdvanced = await runHiddenDomPreScan(currentStep);
-      if (preScanAdvanced) {
-        lastPreScannedStep = null;
+      var preScanState = await runHiddenDomPreScan(currentStep);
+      lastPreScannedStep = currentStep;
+      if (preScanState === 'auto-skip-success') {
         messages = trimConversation(messages);
         continue;
       }
-      lastPreScannedStep = currentStep;
     }
 
     var navGuidance = codeSubmittedThisStep
